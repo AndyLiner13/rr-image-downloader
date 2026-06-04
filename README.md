@@ -2,116 +2,232 @@
   <img src="assets/icon.png" alt="App Icon" width="75">
 </div>
 
-**Update notice (Jun 2026):** There was an error where auto-updates were incorrectly disabled while the app was in *viewer-only mode*. Download **v4.0.7 or newer** from the releases page to fix this.
-
 # RR Image Downloader / Offline Viewer
 
-This is an Electron + React desktop app for saving your Rec Room / RecNet images locally, browsing them offline, and exploring stats about your library.
+RR Image Downloader is an Electron + React desktop app for saving Rec Room / Rec.net photos locally, browsing them offline, and keeping useful metadata with the images. It can download user photos, feed photos, profile history images, event albums, and room photo galleries.
 
-In the event Rec Room doesn't exist. This application will allow you to download full resolution images of your image library and feed images from Rec Room's CDN. It will also capture important metadata about your images so you will still be able to view tagged users and the room the image was taken in. All while being offline and not connected to Rec Room's services.
+**Use this application at your own risk.** Downloading from Rec Room / Rec.net this way may violate their Terms of Service. The app is designed to be data efficient with caching, deduplication, throttling, and skip logic so repeated runs avoid downloading files that are already on disk.
 
-**\*\*Use this application at your own risk. While Rec Room likely won't come after you it is in violation of their Terms of Service (ToS) to use. This application is deliberatly designed to be data efficient and relies on heavy caching and deduplication to make sure only neccessary data is downloaded. The requests made to Rec Room's services are throttled (configurable defaults to 0.5 seconds) so it should not raise any red flags or result in an IP ban for your account.**\*\*
+## Current Highlights
 
-## Using the app (downloadable executable .exe)
+- Download user photos, feed photos, profile history images, event photos, and room photos.
+- Download photos for all rooms in a `myrooms.json` manifest.
+- Select specific rooms from `myrooms.json` instead of downloading every room.
+- Add rooms manually by room name or room ID, even if they are not your rooms.
+- Resume large room photo scans from the saved cursor or inferred metadata position instead of restarting at the newest page.
+- Skip existing images automatically.
+- Browse downloaded room photos in pages of 100 thumbnails so very large folders do not overload the UI.
+- Sort the room preview across the full local room library before paging.
+- Default image preview sort is **Oldest to Newest**.
+- Use **First**, **Previous 100**, **Next 100**, and **Last** buttons in the image preview pager.
+- During active room downloads, the preview refreshes the newest/latest page automatically. If you manually move to page 2 or later, the viewer anchors that page so new batches do not replace the images you were looking at.
+- Collapse the **Download Progress** and **Room photo download list** sections to keep the preview visible.
 
-1. Go to [releases](https://github.com/Winston-Saarloos/rr-image-downloader/releases) and download the executable for your OS.
-2. Run the executable
-3. Download images
-4. Enjoy forever
+## Using the App
 
-## Data locations
+1. Launch `RR Image Downloader.exe`.
+2. Choose or verify your output folder in Settings.
+3. Select a mode from the top-left selector:
+   - User photos
+   - Feed/profile-related photo views
+   - Event photos
+   - Room Photos
+4. Click **Download** or use the controls shown for the selected mode.
+5. Browse downloaded photos in the viewer.
 
-- Downloads live under your chosen output folder (default `output`):
-  - `<output>/<accountId>/images/` - downloaded profile images
-  - `<output>/<accountId>/feed/` - downloaded feed images
-  - `<output>/<accountId>/<accountId>_images.json` and `<accountId>_feed.json` - cached metadata
-- App settings persist at `~/.recnet-photo-downloader/settings.json` (output path, delays, limits).
+## Room Photos
+
+The **Room Photos** tab supports both your room manifest and manually added rooms.
+
+### Download From `myrooms.json`
+
+1. Open the **Room Photos** tab.
+2. Choose a `myrooms.json` file or enter its path.
+3. Click **Load room list**.
+4. Use **Download all room photos** to download every listed room, or select specific rooms and click **Download selected rooms**.
+
+The default manifest path used by this workspace is:
+
+```text
+B:\vsCode\rr-exporter-2\myrooms.json
+```
+
+### Add Other Rooms
+
+Use **Add another room** with either:
+
+```text
+^RoomName
+```
+
+or:
+
+```text
+RoomId
+```
+
+Added rooms are merged into the selectable room list so you can download rooms that are not yours.
+
+### Room Download Resume Behavior
+
+Room galleries are fetched newest-to-oldest from Rec.net. For very large rooms, rerunning from page 1 would waste time reprocessing every newer photo. The app now stores and uses room photo cursors. If a cursor is missing, it infers a resume position from the local room metadata count.
+
+For example, if a room has about `146,180` saved metadata records and the page size is `100`, the next scan starts near:
+
+```text
+skip=146100
+```
+
+The progress and operation logs include the starting skip so you can confirm the run is resuming instead of starting from `skip=0`.
+
+## Image Preview
+
+- The preview renders 100 thumbnails at a time.
+- Sorting and search for room photos are applied to the full local room metadata set first, then the current page is returned.
+- The viewer only shows room photo cards that have a local `.jpg` on disk, so metadata-only records do not appear as blank image cards.
+- Default sort is **Oldest to Newest**.
+- Use **First**, **Previous 100**, **Next 100**, and **Last** to move through large libraries.
+- If a download is running and you stay on the latest page, the visible images refresh as new batches arrive.
+- If you manually navigate away from the default page, the viewer keeps that visible page anchored during refreshes and updates the page number as new images shift your position.
+
+## Data Locations
+
+Downloads live under your chosen output folder:
+
+```text
+<output>/
+```
+
+Common folders include:
+
+```text
+<output>/<accountId>/photos/
+<output>/<accountId>/feed/
+<output>/<accountId>/profile-history/
+<output>/rooms/<roomId>/photos/
+<output>/events/<creatorAccountId>/<eventId>/photos/
+```
+
+Metadata is stored alongside the images, for example:
+
+```text
+<output>/<accountId>/<accountId>_images.json
+<output>/<accountId>/<accountId>_feed.json
+<output>/rooms/<roomId>/<roomId>_photos.json
+<output>/rooms/<roomId>/.folder-meta.json
+```
+
+App settings persist at:
+
+```text
+~\.recnet-photo-downloader\settings.json
+```
+
+## Token Notes
+
+Some downloads may need an access token for private or restricted images.
+
+1. Log in to https://rec.net in your browser.
+2. Open Developer Tools with `F12`.
+3. Open the Network tab and refresh the page.
+4. Search for `account/me`.
+5. Copy the `Authorization` header value.
+6. Remove the leading `Bearer ` text and paste the token into the app.
+
+Tokens expire. If validation fails, grab a fresh token.
 
 ## Troubleshooting
 
-- Validation errors or 401s: fetch a fresh token and ensure it matches the account you searched.
-- Missing images: confirm the output path matches what the app is using and that the account is selected in the viewer.
-- Rate limits or slow responses: increase the request delay in Debug > Settings.
-- Stuck progress: cancel, reopen the Download dialog, and retry (cached metadata will speed things up unless you force refresh).
+- **The viewer shows no room photos:** Confirm the output folder is correct and that `<output>/rooms/<roomId>/photos/` contains `.jpg` files.
+- **Oldest to Newest shows blank cards:** The viewer should now skip metadata-only records. Rebuild and relaunch the root executable if you still see old behavior.
+- **A room scan starts at `skip=0`:** Check the operation logs. Normal large-room resume should show a nonzero starting skip when metadata or cursor data already exists.
+- **Progress panel takes too much space:** Collapse **Download Progress**.
+- **Room list takes too much space:** Collapse **Room photo download list**.
+- **Validation errors or 401s:** Fetch a fresh token and make sure it matches the account or room access you need.
+- **Rate limits or slow responses:** Increase request delay in Settings.
+- **Output folder permission errors:** Choose a writable output folder or run the app with permissions that allow writing there.
 
-## Problems & Solutions:
+## Development Setup
 
-Error: Error invoking remote method 'update-settings': Error: EPERM: operation not permitted, mkdir 'output'
+Prerequisites:
 
-Solution: Right click and run the Photo Downloader as an administrator. The program is unable to save the downloaded data and photos to your hard drive because it does not have permission to do so.
+- Node.js 18+
+- npm
 
-## Features
+Install dependencies:
 
-- Download and view images offline
-- View unique stats about user images
-- View images for multiple accounts
-- Search images for images taken in a certain room or with a certain person
-- Sort images by oldest to newest, newest to oldest, Most Popular (cheer count)
-- Group images by Room, User, or Date
-- Favorite images so they appear in an easy to find album
+```bash
+npm install
+```
 
-#### Favorite Photo Album
+Run in development:
+
+```bash
+npm run dev
+```
+
+Useful development scripts:
+
+```bash
+npm run dev:react-only
+npm run dev:electron
+npm test
+```
+
+## Building
+
+Build and publish the Windows unpacked app into the project root:
+
+```bash
+npm run build:win:dir
+```
+
+This command:
+
+1. Builds the Electron main process.
+2. Builds the React renderer.
+3. Packages the app to `dist/win-unpacked`.
+4. Copies the packaged runtime back into:
+
+```text
+B:\vsCode\rr-exporter-2\rr-image-downloader
+```
+
+The root executable is:
+
+```text
+B:\vsCode\rr-exporter-2\rr-image-downloader\RR Image Downloader.exe
+```
+
+The root publish step is handled by:
+
+```bash
+npm run publish:root
+```
+
+Other build scripts:
+
+```bash
+npm run build
+npm run build:win
+npm run build:mac
+npm run build:linux
+npm run build:all
+```
+
+## Screenshots
+
+### Favorite Photo Album
 
 <div align="center">
    <img src="images/favorite_view.png" alt="Favorite images album view">
 </div>
 
-#### View a variety of stats about a user's photos
+### Stats
 
 <div align="center">
-<img src="images/stats_preview.png" alt="User photo stats">
+  <img src="images/stats_preview.png" alt="User photo stats">
 </div>
-
-## Future Feature Ideas
-
-- Fix images with missing room data (early 2017-2019 images miss this)
-- If a image is taken in a subroom grab the main room name (otherwise we see the room ID and not the actual room name)
-
-## Prerequisites
-
-- Node.js 18+
-- npm
-
-## Setup
-
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. Start the app in development (React + Electron):
-
-   ```bash
-   npm run dev
-   ```
-
-   - `npm run dev:react-only` starts just the renderer for UI work
-   - `npm run dev:electron` runs Electron against the built assets
-
-## Building installers
-
-- Cross-platform build: `npm run build`
-- Platform-specific: `npm run build:win`, `npm run build:mac`, `npm run build:linux`, or `npm run build:all`
-- Output goes to `dist/` (packaged by electron-builder)
-
-## Using the app (code version)
-
-0. Install dependencies `npm install`
-1. Launch the app (`npm run dev` or run a packaged build).
-2. Click **Download**.
-3. Enter the RecNet **username** to search for the account (the UI will confirm when it finds a match).
-4. Choose an **Output folder** (default is `output`).
-5. (Optional) Add an access **token** if you need private images:
-   - Log in to https://rec.net in your browser.
-   - Open Developer Tools (f12) > Network, refresh the page, and search for 'account/me'.
-   - Copy the `Authorization` header value, remove the leading `Bearer `, and paste the token.
-   - Tokens expire after a hour; grab a fresh one if validation fails.
-6. Use **Force user data refresh** / **Force room data refresh** if cached info may be stale.
-7. Click **Download**. Watch the progress panel; you can cancel mid-run if needed.
-8. Browse results in the **image Viewer**:
-   - Switch between images and Feed, change accounts, search, group, and sort.
-   - Open a image for details and metadata.
-9. Open **Stats** to see charts and summary metrics for the selected account.
-10. Use the **Debug** menu (gear icon) to change the output path, adjust request delay, set a max download count for testing, and view logs/results.
 
 ## License
 
