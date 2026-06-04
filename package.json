@@ -1,0 +1,153 @@
+{
+  "name": "rr-image-downloader",
+  "version": "4.0.7",
+  "description": "RR Image Downloader - Download Rec Room user images.",
+  "main": "dist/main/main/main.js",
+  "homepage": "./",
+  "scripts": {
+    "start": "electron dist/main/main/main.js",
+    "dev": "concurrently \"npm run dev:react\" \"wait-on http://localhost:3000 && npm run dev:electron\"",
+    "dev:electron": "tsc && electron dist/main/main/main.js --dev",
+    "dev:react": "react-scripts start",
+    "dev:react-only": "react-scripts start",
+    "build": "npm run build:main && npm run build:react && node build-electron.js && electron-builder",
+    "build:main": "tsc && npm run copy:assets",
+    "copy:assets": "node -e \"require('fs-extra').copySync('assets', 'dist/main/assets')\"",
+    "build:react": "react-scripts build",
+    "build:win": "npm run build:main && npm run build:react && node build-electron.js && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "build:win:dir": "npm run build:main && npm run build:react && node build-electron.js && electron-builder --win --dir --config.win.signAndEditExecutable=false && npm run publish:root",
+    "publish:root": "node scripts/publish-win-unpacked-to-root.js",
+    "dist": "npm run build:main && npm run build:react && node build-electron.js && electron-builder --publish=never",
+    "eject": "react-scripts eject",
+    "lint": "eslint src --ext .js,.jsx,.ts,.tsx",
+    "lint:fix": "eslint src --ext .js,.jsx,.ts,.tsx --fix",
+    "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,json,css,md}\"",
+    "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,json,css,md}\"",
+    "build:mac": "npm run build:main && npm run build:react && node build-electron.js && electron-builder --mac",
+    "build:linux": "npm run build:main && npm run build:react && node build-electron.js && electron-builder --linux",
+    "build:all": "npm run build:main && npm run build:react && node build-electron.js && electron-builder --win --mac --linux",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [
+    "recnet",
+    "rec-room",
+    "photo-downloader",
+    "electron",
+    "react",
+    "typescript"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/json-bigint": "^1.0.4",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@typescript-eslint/eslint-plugin": "^5.62.0",
+    "@typescript-eslint/parser": "^5.62.0",
+    "autoprefixer": "^10.4.0",
+    "concurrently": "^8.0.0",
+    "cross-env": "^10.1.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0",
+    "electron-packager": "^17.1.2",
+    "eslint": "^8.0.0",
+    "eslint-import-resolver-typescript": "^3.6.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-react": "^7.0.0",
+    "eslint-plugin-react-hooks": "^4.0.0",
+    "jest": "^29.7.0",
+    "postcss": "^8.4.0",
+    "prettier": "^3.0.0",
+    "react-scripts": "5.0.1",
+    "tailwindcss": "^3.3.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^4.9.5",
+    "wait-on": "^7.0.0"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "axios": "^1.6.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "electron-updater": "^6.6.2",
+    "fs-extra": "^11.0.0",
+    "json-bigint": "^1.0.0",
+    "lucide-react": "^0.294.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recharts": "^2.10.3",
+    "tailwind-merge": "^3.4.0",
+    "tailwindcss-animate": "^1.0.7"
+  },
+  "build": {
+    "appId": "com.rr-image-downloader",
+    "productName": "RR Image Downloader",
+    "extraMetadata": {
+      "main": "main/main/main.js"
+    },
+    "directories": {
+      "app": "build",
+      "output": "dist"
+    },
+    "files": [
+      "**/*"
+    ],
+    "icon": "assets/icon.png",
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.utilities"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Utility"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Winston-Saarloos",
+      "repo": "rr-image-downloader",
+      "releaseType": "release"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "RR-Image-Downloader-Setup-${version}.${ext}"
+    }
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "packageManager": "pnpm@10.25.0+sha512.5e82639027af37cf832061bcc6d639c219634488e0f2baebe785028a793de7b525ffcd3f7ff574f5e9860654e098fe852ba8ac5dd5cefe1767d23a020a92f501"
+}

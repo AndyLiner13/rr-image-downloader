@@ -1,0 +1,2282 @@
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  IpcMainInvokeEvent,
+  Menu,
+  protocol,
+  shell,
+} from 'electron';
+import * as path from 'path';
+import * as fs from 'fs-extra';
+import { autoUpdater } from 'electron-updater';
+import { RecNetService } from './services/recnet-service';
+import {
+  CollectionResult,
+  DownloadPreflightSummary,
+  DownloadResult,
+  ProfileHistoryAccessResult,
+  ProfileHistoryCollectionResult,
+  RecNetSettings,
+  Progress,
+  AccountInfo,
+  AvailableEvent,
+  AvailableEventCreator,
+  AvailableRoom,
+  EventDiscoveryResult,
+  EventPhotoBatchResult,
+  Photo,
+  PhotoPageResult,
+  PlayerResult,
+  RoomDto,
+  RoomPhotoBatchResult,
+  RoomPhotoSort,
+  LibraryMoveResult,
+  MetadataSyncResult,
+  MyRoomsManifestResult,
+} from '../shared/types';
+import type { DownloadSourceSelection } from '../shared/download-sources';
+import { EventDto } from './models/EventDto';
+import { ImageCommentDto } from './models/ImageCommentDto';
+import {
+  isViewerOnlyMode,
+  VIEWER_ONLY_MODE_ERROR,
+} from '../shared/viewer-only-mode';
+import { pathsEffectivelyEqual } from './services/library-move';
+
+// Keep a global reference of the window object
+let mainWindow: BrowserWindow | null = null;
+let recNetService: RecNetService;
+
+function getViewerOnlyNetworkError(): string | null {
+  return isViewerOnlyMode() ? VIEWER_ONLY_MODE_ERROR : null;
+}
+
+function viewerOnlyApiResponse<T>(): ApiResponse<T> {
+  return { success: false, error: VIEWER_ONLY_MODE_ERROR };
+}
+
+function emptyMetadataSyncResult(): MetadataSyncResult {
+  return {
+    accountsProcessed: 0,
+    creatorsProcessed: 0,
+    eventsProcessed: 0,
+    roomsProcessed: 0,
+  };
+}
+
+/** Serialize metadata image sync jobs (launch, debug force, output path change). */
+let metadataSyncMutex: Promise<void> = Promise.resolve();
+let activeMetadataSyncAbort: AbortController | null = null;
+
+function cancelActiveMetadataSync(): void {
+  if (activeMetadataSyncAbort && !activeMetadataSyncAbort.signal.aborted) {
+    activeMetadataSyncAbort.abort();
+  }
+}
+
+function enqueueMetadataSync(force: boolean): Promise<MetadataSyncResult> {
+  const next = metadataSyncMutex.then(async (): Promise<MetadataSyncResult> => {
+    if (!recNetService || isViewerOnlyMode()) {
+      return emptyMetadataSyncResult();
+    }
+    const settings = await recNetService.getSettings();
+    if (
+      !force &&
+      (!settings.backgroundMetadataSyncEnabled ||
+        !settings.outputPathConfiguredForDownload ||
+        !(settings.resolvedOutputRoot ?? '').trim())
+    ) {
+      return emptyMetadataSyncResult();
+    }
+    const abortController = new AbortController();
+    activeMetadataSyncAbort = abortController;
+    const wc = mainWindow?.webContents;
+    wc?.send('metadata-sync-state', {
+      phase: 'running',
+      currentStep: 'Starting metadata image sync',
+      current: 0,
+      total: 0,
+      checkedAssets: 0,
+      totalAssets: 0,
+      downloadedAssets: 0,
+      skippedAssets: 0,
+      failedAssets: 0,
+      force,
+    });
+    try {
+      return await recNetService.syncMetadataLibraryAssets({
+        force,
+        signal: abortController.signal,
+        onProgress: progress => {
+          wc?.send('metadata-sync-state', {
+            phase: 'running',
+            ...progress,
+          });
+        },
+      });
+    } finally {
+      if (activeMetadataSyncAbort === abortController) {
+        activeMetadataSyncAbort = null;
+      }
+      wc?.send('metadata-sync-state', { phase: 'idle' });
+    }
+  });
+  metadataSyncMutex = next.then(() => undefined).catch(() => undefined);
+  return next;
+}
+
+async function enqueueBackgroundMetadataSync(): Promise<void> {
+  if (!recNetService || isViewerOnlyMode()) {
+    return;
+  }
+  void enqueueMetadataSync(false);
+}
+
+async function withInlineMetadataSyncIndicator<T>(
+  event: IpcMainInvokeEvent,
+  currentStep: string,
+  work: (
+    onProgress: NonNullable<
+      Parameters<typeof recNetService.syncMetadataLibraryAssets>[0]
+    >['onProgress']
+  ) => Promise<T>
+): Promise<T> {
+  const wc = event.sender;
+  let didReport = false;
+  try {
+    return await work(progress => {
+      didReport = true;
+      wc?.send('metadata-sync-state', {
+        phase: 'running',
+        currentStep,
+        ...progress,
+      });
+    });
+  } finally {
+    if (didReport) {
+      wc?.send('metadata-sync-state', { phase: 'idle' });
+    }
+  }
+}
+
+function scheduleInitialMetadataSync(): void {
+  if (!mainWindow || mainWindow.isDestroyed() || isViewerOnlyMode()) {
+    return;
+  }
+  const wc = mainWindow.webContents;
+  const start = () => {
+    setTimeout(() => {
+      void enqueueBackgroundMetadataSync();
+    }, 500);
+  };
+  if (wc.isLoading()) {
+    wc.once('did-finish-load', start);
+  } else {
+    start();
+  }
+}
+const isDev = process.argv.includes('--dev');
+
+const MAIN_WINDOW_MIN_WIDTH = 850;
+const MAIN_WINDOW_MIN_HEIGHT = 600;
+
+function enforceMainWindowMinimumSize(win: BrowserWindow): void {
+  if (win.isDestroyed()) {
+    return;
+  }
+  const { width, height } = win.getBounds();
+  const nextWidth = Math.max(MAIN_WINDOW_MIN_WIDTH, width);
+  const nextHeight = Math.max(MAIN_WINDOW_MIN_HEIGHT, height);
+  if (nextWidth !== width || nextHeight !== height) {
+    win.setSize(nextWidth, nextHeight, false);
+  }
+}
+
+interface CollectPhotosParams {
+  accountId: string;
+  token?: string;
+  forceAccountsRefresh?: boolean;
+  forceRoomsRefresh?: boolean;
+  forceEventsRefresh?: boolean;
+  forceImageCommentsRefresh?: boolean;
+}
+
+interface CollectFeedPhotosParams {
+  accountId: string;
+  token?: string;
+  incremental?: boolean;
+  forceAccountsRefresh?: boolean;
+  forceRoomsRefresh?: boolean;
+  forceEventsRefresh?: boolean;
+  forceImageCommentsRefresh?: boolean;
+}
+
+interface DownloadPhotosParams {
+  accountId: string;
+  token?: string;
+}
+
+interface ValidateProfileHistoryAccessParams {
+  username: string;
+  token: string;
+}
+
+interface BuildDownloadPreflightParams {
+  accountId: string;
+  downloadSources: DownloadSourceSelection;
+}
+
+interface LookupRoomParams {
+  roomName: string;
+  token?: string;
+}
+
+interface LookupRoomByIdParams {
+  roomId: string;
+  token?: string;
+}
+
+interface DownloadRoomPhotoBatchParams {
+  roomName?: string;
+  roomId?: string;
+  room?: RoomDto;
+  token?: string;
+  startSkip?: number;
+  batchPages?: number;
+  pageSize?: number;
+  sort?: RoomPhotoSort;
+  forceAccountsRefresh?: boolean;
+  forceRoomsRefresh?: boolean;
+  forceEventsRefresh?: boolean;
+  forceImageCommentsRefresh?: boolean;
+}
+
+interface DiscoverEventsForUsernameParams {
+  username: string;
+  token?: string;
+  persist?: boolean;
+}
+
+interface DownloadEventPhotosParams {
+  creatorAccountId: string;
+  eventIds: string[];
+  token?: string;
+}
+
+interface LoadEventAlbumPhotosParams {
+  creatorAccountId: string;
+  eventId: string;
+}
+
+interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+const normalizeId = (value: unknown): string => {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return '';
+    }
+    return Math.trunc(value).toString();
+  }
+
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  return '';
+};
+
+const normalizePhotoRecord = (photo: Photo): Photo => {
+  const taggedPlayerIds = Array.isArray(photo.TaggedPlayerIds)
+    ? photo.TaggedPlayerIds.map(id => normalizeId(id)).filter(Boolean)
+    : [];
+  const playerEventId = normalizeId(photo.PlayerEventId);
+  const eventId = normalizeId(photo.EventId);
+  const eventInstanceId = normalizeId(photo.EventInstanceId);
+
+  return {
+    ...photo,
+    Id: normalizeId(photo.Id),
+    PlayerId: normalizeId(photo.PlayerId),
+    RoomId: normalizeId(photo.RoomId),
+    TaggedPlayerIds: taggedPlayerIds,
+    PlayerEventId: playerEventId || undefined,
+    EventId: eventId || undefined,
+    EventInstanceId: eventInstanceId || undefined,
+  };
+};
+
+type PhotoPreviewSort =
+  | 'oldest-to-newest'
+  | 'newest-to-oldest'
+  | 'most-cheered'
+  | 'most-comments';
+
+const parsePhotoDate = (photo: Photo): number =>
+  photo.CreatedAt ? new Date(photo.CreatedAt).getTime() || 0 : 0;
+
+const sortPhotosForPreview = (
+  photos: Photo[],
+  sortBy: PhotoPreviewSort = 'oldest-to-newest'
+): Photo[] => {
+  const sorted = [...photos];
+  switch (sortBy) {
+    case 'oldest-to-newest':
+      return sorted.sort((a, b) => parsePhotoDate(a) - parsePhotoDate(b));
+    case 'most-cheered':
+      return sorted.sort(
+        (a, b) => (Number(b.CheerCount) || 0) - (Number(a.CheerCount) || 0)
+      );
+    case 'most-comments':
+      return sorted.sort(
+        (a, b) => (Number(b.CommentCount) || 0) - (Number(a.CommentCount) || 0)
+      );
+    case 'newest-to-oldest':
+    default:
+      return sorted.sort((a, b) => parsePhotoDate(b) - parsePhotoDate(a));
+  }
+};
+
+const filterPhotosForPreview = (
+  photos: Photo[],
+  searchQuery?: string,
+  favoriteIds?: string[]
+): Photo[] => {
+  const query = (searchQuery ?? '').trim().toLowerCase();
+  const shouldFilterFavorites = favoriteIds !== undefined;
+  const favoriteIdSet = new Set((favoriteIds ?? []).map(id => normalizeId(id)));
+
+  return photos.filter(photo => {
+    if (shouldFilterFavorites && !favoriteIdSet.has(normalizeId(photo.Id))) {
+      return false;
+    }
+
+    if (!query) {
+      return true;
+    }
+
+    return [
+      photo.Id,
+      photo.ImageName,
+      photo.Description,
+      photo.RoomId,
+      photo.PlayerId,
+      photo.PlayerEventId,
+      photo.EventId,
+      photo.EventInstanceId,
+      ...(Array.isArray(photo.TaggedPlayerIds) ? photo.TaggedPlayerIds : []),
+    ]
+      .filter(value => value !== undefined && value !== null)
+      .join(' ')
+      .toLowerCase()
+      .includes(query);
+  });
+};
+
+const normalizePlayerRecord = (player: PlayerResult): PlayerResult => ({
+  ...player,
+  accountId: normalizeId(player.accountId),
+});
+
+const normalizeRoomRecord = (room: RoomDto): RoomDto => ({
+  ...room,
+  RoomId: normalizeId(room.RoomId),
+  CreatorAccountId: normalizeId(room.CreatorAccountId),
+  RankedEntityId: normalizeId(room.RankedEntityId),
+});
+
+const normalizeEventRecord = (event: EventDto): EventDto => ({
+  ...event,
+  PlayerEventId: normalizeId(event.PlayerEventId),
+  CreatorPlayerId: normalizeId(event.CreatorPlayerId),
+  RoomId: normalizeId(event.RoomId),
+});
+
+const normalizeImageCommentRecord = (
+  comment: ImageCommentDto
+): ImageCommentDto => {
+  const cheer =
+    typeof comment.CheerCount === 'number' &&
+    Number.isFinite(comment.CheerCount)
+      ? comment.CheerCount
+      : 0;
+  return {
+    ...comment,
+    SavedImageCommentId: normalizeId(comment.SavedImageCommentId),
+    SavedImageId: normalizeId(comment.SavedImageId),
+    PlayerId: normalizeId(comment.PlayerId),
+    Comment:
+      typeof comment.Comment === 'string'
+        ? comment.Comment
+        : String(comment.Comment ?? ''),
+    CreatedAt:
+      typeof comment.CreatedAt === 'string'
+        ? comment.CreatedAt
+        : String(comment.CreatedAt ?? ''),
+    CheerCount: cheer,
+  };
+};
+
+function getMyRoomsCandidatePaths(): string[] {
+  const candidates = [
+    path.join(path.resolve(process.cwd(), '..'), 'myrooms.json'),
+    path.join(process.cwd(), 'myrooms.json'),
+    path.join(path.resolve(app.getAppPath(), '..'), 'myrooms.json'),
+    path.join(app.getAppPath(), 'myrooms.json'),
+    path.join(path.resolve(__dirname, '..', '..', '..'), 'myrooms.json'),
+    'B:\\vsCode\\rr-exporter-2\\myrooms.json',
+  ];
+
+  return Array.from(
+    new Set(candidates.map(candidate => path.resolve(candidate)))
+  );
+}
+
+async function resolveMyRoomsManifestPath(
+  sourcePath?: string
+): Promise<string> {
+  const supplied = (sourcePath ?? '').trim();
+  if (supplied) {
+    const resolved = path.resolve(supplied);
+    if (!(await fs.pathExists(resolved))) {
+      throw new Error(`myrooms.json path does not exist: ${resolved}`);
+    }
+
+    const stat = await fs.stat(resolved);
+    const manifestPath = stat.isDirectory()
+      ? path.join(resolved, 'myrooms.json')
+      : resolved;
+    if (!(await fs.pathExists(manifestPath))) {
+      throw new Error(`Could not find myrooms.json at: ${manifestPath}`);
+    }
+    return manifestPath;
+  }
+
+  for (const candidate of getMyRoomsCandidatePaths()) {
+    if (await fs.pathExists(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(
+    `Could not find myrooms.json. Checked: ${getMyRoomsCandidatePaths().join(', ')}`
+  );
+}
+
+function parseMyRoomsManifest(raw: unknown): RoomDto[] {
+  const root =
+    raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const roomsValue = root.Rooms ?? raw;
+  const roomEntries: Array<[string, unknown]> = Array.isArray(roomsValue)
+    ? roomsValue.map((room, index) => [String(index), room])
+    : roomsValue && typeof roomsValue === 'object'
+      ? Object.entries(roomsValue as Record<string, unknown>)
+      : [];
+  const roomsById = new Map<string, RoomDto>();
+
+  for (const [key, value] of roomEntries) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+
+    const record = value as Partial<RoomDto> & Record<string, unknown>;
+    const withFallbackId = {
+      ...record,
+      RoomId: record.RoomId ?? key,
+    } as RoomDto;
+    const room = normalizeRoomRecord(withFallbackId);
+    if (!room.RoomId) {
+      continue;
+    }
+    roomsById.set(room.RoomId, room);
+  }
+
+  return Array.from(roomsById.values()).sort((a, b) =>
+    (a.Name || a.RoomId || '').localeCompare(
+      b.Name || b.RoomId || '',
+      undefined,
+      {
+        sensitivity: 'base',
+        numeric: true,
+      }
+    )
+  );
+}
+
+function attachEditableContextMenu(win: BrowserWindow): void {
+  win.webContents.on('context-menu', (_event, params) => {
+    const { editFlags, isEditable, selectionText } = params;
+    const template: Electron.MenuItemConstructorOptions[] = [];
+
+    if (isEditable) {
+      template.push(
+        { role: 'undo', enabled: editFlags.canUndo },
+        { role: 'redo', enabled: editFlags.canRedo },
+        { type: 'separator' },
+        { role: 'cut', enabled: editFlags.canCut },
+        { role: 'copy', enabled: editFlags.canCopy },
+        { role: 'paste', enabled: editFlags.canPaste },
+        { type: 'separator' },
+        { role: 'selectAll', enabled: editFlags.canSelectAll }
+      );
+    } else if ((selectionText ?? '').trim()) {
+      template.push({ role: 'copy', enabled: editFlags.canCopy });
+    }
+
+    if (template.length === 0) {
+      return;
+    }
+
+    Menu.buildFromTemplate(template).popup({ window: win });
+  });
+}
+
+function createWindow(): void {
+  // Create the browser window
+  const win = new BrowserWindow({
+    width: 1000,
+    height: 700,
+    minWidth: MAIN_WINDOW_MIN_WIDTH,
+    minHeight: MAIN_WINDOW_MIN_HEIGHT,
+    frame: false, // Remove default title bar for custom header
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+    icon: path.join(__dirname, '../../public/favicon.ico'),
+    title: 'Rec Room Photo Downloader',
+  });
+  mainWindow = win;
+
+  win.setMinimumSize(MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT);
+  enforceMainWindowMinimumSize(win);
+  win.on('resize', () => enforceMainWindowMinimumSize(win));
+
+  // Load the app
+  if (isDev) {
+    win.loadURL('http://localhost:3000');
+  } else {
+    // Use app.getAppPath() in production to get the correct app directory
+    const appPath = app.getAppPath();
+    const indexPath = path.join(appPath, 'index.html');
+    console.log('Loading index.html from:', indexPath); // Debug log
+    win.loadFile(indexPath).catch(error => {
+      console.error('Error loading index.html:', error);
+      // Fallback: try alternative path
+      const altPath = path.join(__dirname, '../../index.html');
+      console.log('Trying alternative path:', altPath);
+      win.loadFile(altPath).catch(fallbackError => {
+        console.error('Fallback path also failed:', fallbackError);
+      });
+    });
+  }
+
+  // Add error handlers to debug loading issues
+  win.webContents.on(
+    'did-fail-load',
+    (event, errorCode, errorDescription, validatedURL) => {
+      console.error('Failed to load:', {
+        errorCode,
+        errorDescription,
+        validatedURL,
+      });
+    }
+  );
+
+  win.webContents.on('dom-ready', () => {
+    console.log('DOM ready');
+  });
+
+  // Open DevTools in development
+  if (isDev) {
+    win.webContents.openDevTools();
+  }
+
+  attachEditableContextMenu(win);
+
+  // Handle window closed
+  win.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+// Forward progress events from service to renderer
+function setupProgressForwarding() {
+  if (recNetService && mainWindow && !mainWindow.isDestroyed()) {
+    // Remove any existing listeners to avoid duplicates
+    recNetService.removeAllListeners('progress-update');
+    recNetService.on('progress-update', (progress: Progress) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('progress-update', progress);
+      }
+    });
+  }
+}
+
+// Register custom protocol for serving local files
+function registerLocalFileProtocol() {
+  protocol.registerFileProtocol('local', (request, callback) => {
+    const filePath = request.url.replace('local://', '');
+    try {
+      // Decode the file path
+      const decodedPath = decodeURIComponent(filePath);
+      callback({ path: decodedPath });
+    } catch (error) {
+      console.error('Error serving local file:', error);
+      callback({ error: -2 }); // FILE_NOT_FOUND
+    }
+  });
+}
+
+// Setup auto-updater event handlers
+function setupAutoUpdater() {
+  if (isDev) {
+    console.log('Auto-updater disabled in development mode');
+    return;
+  }
+
+  // Configure auto-updater — do not auto-download; user must confirm
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true; // Install on app quit
+
+  // Update available — notify renderer with size when available so user can confirm before download
+  autoUpdater.on('update-available', info => {
+    console.log('Update available:', info.version);
+    const files = (info as { files?: Array<{ size?: number }> }).files;
+    const sizeBytes =
+      files?.reduce((sum, f) => sum + (f.size ?? 0), 0) ?? undefined;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-available', {
+        version: info.version,
+        releaseDate: info.releaseDate,
+        releaseNotes: info.releaseNotes,
+        sizeBytes,
+      });
+    }
+  });
+
+  // Update not available
+  autoUpdater.on('update-not-available', () => {
+    console.log('Update not available');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-not-available');
+    }
+  });
+
+  // Update download progress
+  autoUpdater.on('download-progress', progressObj => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-download-progress', {
+        percent: progressObj.percent,
+        transferred: progressObj.transferred,
+        total: progressObj.total,
+      });
+    }
+  });
+
+  // Update downloaded and ready to install
+  autoUpdater.on('update-downloaded', info => {
+    console.log('Update downloaded:', info.version);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-downloaded', {
+        version: info.version,
+      });
+    }
+  });
+
+  // Error handling
+  autoUpdater.on('error', error => {
+    console.error('Auto-updater error:', error);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', {
+        message: error.message,
+      });
+    }
+  });
+
+  // Check for updates when the main window has finished loading
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      autoUpdater.checkForUpdates().catch(error => {
+        console.error('Error checking for updates:', error);
+      });
+    });
+  }
+}
+
+// App event handlers
+app.whenReady().then(() => {
+  // Register custom protocol before creating window
+  registerLocalFileProtocol();
+
+  createWindow();
+
+  // Initialize RecNet service
+  recNetService = new RecNetService();
+
+  // Forward progress events from service to renderer
+  setupProgressForwarding();
+
+  // Setup auto-updater
+  setupAutoUpdater();
+
+  scheduleInitialMetadataSync();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+      setupProgressForwarding();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+async function getOutputWriteBlockedError(): Promise<string | null> {
+  return recNetService.getOutputConfigurationError();
+}
+
+ipcMain.handle(
+  'sync-metadata-assets',
+  async (
+    _event: IpcMainInvokeEvent,
+    opts?: { force?: boolean }
+  ): Promise<ApiResponse<MetadataSyncResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const data = await enqueueMetadataSync(Boolean(opts?.force));
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// IPC handlers for communication with renderer process
+ipcMain.handle(
+  'collect-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: CollectPhotosParams
+  ): Promise<ApiResponse<CollectionResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.collectPhotos(
+        params.accountId,
+        params.token,
+        {
+          forceAccountsRefresh: params.forceAccountsRefresh,
+          forceRoomsRefresh: params.forceRoomsRefresh,
+          forceEventsRefresh: params.forceEventsRefresh,
+          forceImageCommentsRefresh: params.forceImageCommentsRefresh,
+        }
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'collect-feed-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: CollectFeedPhotosParams
+  ): Promise<ApiResponse<CollectionResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.collectFeedPhotos(
+        params.accountId,
+        params.token,
+        params.incremental ?? true,
+        {
+          forceAccountsRefresh: params.forceAccountsRefresh,
+          forceRoomsRefresh: params.forceRoomsRefresh,
+          forceEventsRefresh: params.forceEventsRefresh,
+          forceImageCommentsRefresh: params.forceImageCommentsRefresh,
+        }
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'collect-profile-history-manifest',
+  async (
+    event: IpcMainInvokeEvent,
+    params: ValidateProfileHistoryAccessParams & { accountId: string }
+  ): Promise<ApiResponse<ProfileHistoryCollectionResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.collectProfileHistoryManifest(
+        params.accountId,
+        params.token
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'build-download-preflight',
+  async (
+    event: IpcMainInvokeEvent,
+    params: BuildDownloadPreflightParams
+  ): Promise<ApiResponse<DownloadPreflightSummary>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.buildDownloadPreflightSummary(
+        params.accountId,
+        params.downloadSources
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: DownloadPhotosParams
+  ): Promise<ApiResponse<DownloadResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await withInlineMetadataSyncIndicator(
+        event,
+        'Waiting for user metadata image sync',
+        onProgress =>
+          recNetService.downloadPhotos(
+            params.accountId,
+            params.token,
+            onProgress
+          )
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-feed-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: DownloadPhotosParams
+  ): Promise<ApiResponse<DownloadResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await withInlineMetadataSyncIndicator(
+        event,
+        'Waiting for feed metadata image sync',
+        onProgress =>
+          recNetService.downloadFeedPhotos(
+            params.accountId,
+            params.token,
+            onProgress
+          )
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-profile-history',
+  async (
+    event: IpcMainInvokeEvent,
+    params: ValidateProfileHistoryAccessParams & { accountId: string }
+  ): Promise<ApiResponse<DownloadResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.downloadProfileHistory(
+        params.accountId,
+        params.token
+      );
+      void enqueueBackgroundMetadataSync();
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'lookup-room-by-name',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LookupRoomParams
+  ): Promise<ApiResponse<RoomDto>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = await recNetService.lookupRoomByName(
+        params.roomName,
+        params.token
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'lookup-room-by-id',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LookupRoomByIdParams
+  ): Promise<ApiResponse<RoomDto>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = await recNetService.lookupRoomById(
+        params.roomId,
+        params.token
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-room-photo-batch',
+  async (
+    event: IpcMainInvokeEvent,
+    params: DownloadRoomPhotoBatchParams
+  ): Promise<ApiResponse<RoomPhotoBatchResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await withInlineMetadataSyncIndicator(
+        event,
+        'Waiting for room metadata image sync',
+        onProgress => recNetService.downloadRoomPhotoBatch(params, onProgress)
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-my-rooms-manifest',
+  async (
+    _event: IpcMainInvokeEvent,
+    params?: { sourcePath?: string }
+  ): Promise<ApiResponse<MyRoomsManifestResult>> => {
+    try {
+      const sourcePath = await resolveMyRoomsManifestPath(params?.sourcePath);
+      const raw = await fs.readJson(sourcePath);
+      const rooms = parseMyRoomsManifest(raw);
+      return { success: true, data: { sourcePath, rooms } };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle('select-my-rooms-json', async (): Promise<string | null> => {
+  const dialogOptions: Electron.OpenDialogOptions = {
+    title: 'Choose myrooms.json',
+    properties: ['openFile'],
+    filters: [{ name: 'JSON files', extensions: ['json'] }],
+  };
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions);
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  return result.filePaths[0];
+});
+
+ipcMain.handle(
+  'discover-events-for-username',
+  async (
+    event: IpcMainInvokeEvent,
+    params: DiscoverEventsForUsernameParams
+  ): Promise<ApiResponse<EventDiscoveryResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.discoverEventsForUsername(
+        params.username,
+        params.token,
+        { persist: params.persist }
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-event-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: DownloadEventPhotosParams
+  ): Promise<ApiResponse<EventPhotoBatchResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await withInlineMetadataSyncIndicator(
+        event,
+        'Waiting for event metadata image sync',
+        onProgress => recNetService.downloadEventPhotos(params, onProgress)
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'validate-profile-history-access',
+  async (
+    event: IpcMainInvokeEvent,
+    params: ValidateProfileHistoryAccessParams
+  ): Promise<ApiResponse<ProfileHistoryAccessResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = await recNetService.validateProfileHistoryAccess(
+        params.username,
+        params.token
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle('select-output-folder', async (): Promise<string | null> => {
+  if (!mainWindow) return null;
+
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory'],
+    title: 'Select Output Folder',
+  });
+
+  if (!result.canceled && result.filePaths.length > 0) {
+    return result.filePaths[0];
+  }
+  return null;
+});
+
+ipcMain.handle('get-settings', async (): Promise<RecNetSettings> => {
+  return await recNetService.getSettings();
+});
+
+ipcMain.handle(
+  'update-settings',
+  async (
+    event: IpcMainInvokeEvent,
+    settings: Partial<RecNetSettings>
+  ): Promise<RecNetSettings> => {
+    const before = await recNetService.getSettings();
+    const prevRoot = (before.resolvedOutputRoot ?? '').trim();
+    const updated = await recNetService.updateSettings(settings);
+    const nextRoot = (updated.resolvedOutputRoot ?? '').trim();
+    const backgroundSyncTurnedOn =
+      settings.backgroundMetadataSyncEnabled === true &&
+      before.backgroundMetadataSyncEnabled !== true;
+    if (metadataOutputRootChanged(prevRoot, nextRoot)) {
+      cancelActiveMetadataSync();
+    }
+    if (
+      metadataOutputRootChanged(prevRoot, nextRoot) ||
+      backgroundSyncTurnedOn
+    ) {
+      void enqueueBackgroundMetadataSync();
+    }
+    return updated;
+  }
+);
+
+function metadataOutputRootChanged(prev: string, next: string): boolean {
+  const n = next.trim();
+  const p = prev.trim();
+  if (!p && !n) {
+    return false;
+  }
+  if (!p || !n) {
+    return true;
+  }
+  return !pathsEffectivelyEqual(p, n);
+}
+
+ipcMain.handle(
+  'library-move-start',
+  async (
+    _event: IpcMainInvokeEvent,
+    dest: string
+  ): Promise<ApiResponse<LibraryMoveResult>> => {
+    try {
+      const result = await recNetService.moveLibraryTo(dest, progress => {
+        if (!mainWindow || mainWindow.isDestroyed()) {
+          return;
+        }
+        mainWindow.webContents.send('library-move-progress', progress);
+      });
+      if (result.success) {
+        return { success: true, data: result };
+      }
+      return {
+        success: false,
+        error: result.error ?? 'Library move failed.',
+        data: result,
+      };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle('library-move-cancel', (): boolean => {
+  return recNetService.cancelLibraryMove();
+});
+
+// Progress tracking
+ipcMain.handle('get-progress', async (): Promise<Progress> => {
+  return recNetService.getProgress();
+});
+
+// Cancel operations
+ipcMain.handle('cancel-operation', async (): Promise<boolean> => {
+  return recNetService.cancelCurrentOperation();
+});
+
+// Lookup account information by account ID
+ipcMain.handle(
+  'lookup-account-by-id',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<AccountInfo>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = await recNetService.lookupAccountById(accountId);
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Lookup account information by username
+ipcMain.handle(
+  'lookup-account-by-username',
+  async (
+    event: IpcMainInvokeEvent,
+    username: string,
+    token?: string
+  ): Promise<ApiResponse<AccountInfo>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = await recNetService.lookupAccountByUsername(
+        username,
+        token
+      );
+      return { success: true, data: result };
+    } catch (error) {
+      const message = (error as Error).message ?? String(error);
+
+      if (token && /HTTP\s+(401|403)\b/.test(message)) {
+        try {
+          const fallback =
+            await recNetService.lookupAccountByUsername(username);
+          return { success: true, data: fallback };
+        } catch (fallbackError) {
+          return {
+            success: false,
+            error: (fallbackError as Error).message ?? String(fallbackError),
+          };
+        }
+      }
+
+      return { success: false, error: message };
+    }
+  }
+);
+
+// Search accounts by username
+ipcMain.handle(
+  'search-accounts',
+  async (
+    event: IpcMainInvokeEvent,
+    username: string,
+    token?: string
+  ): Promise<ApiResponse<AccountInfo[]>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const result = token
+        ? await recNetService.searchAccounts(username, token)
+        : await recNetService.searchAccounts(username);
+      return { success: true, data: result };
+    } catch (error) {
+      const message = (error as Error).message ?? String(error);
+
+      // If the provided token isn't authorized, still allow downloads by
+      // falling back to unauthenticated account search.
+      if (token && /HTTP\s+(401|403)\b/.test(message)) {
+        try {
+          const result = await recNetService.searchAccounts(username);
+          return { success: true, data: result };
+        } catch (fallbackError) {
+          return {
+            success: false,
+            error: (fallbackError as Error).message ?? String(fallbackError),
+          };
+        }
+      }
+
+      return { success: false, error: message };
+    }
+  }
+);
+
+// Clear account data
+ipcMain.handle(
+  'clear-account-data',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<{ filesRemoved: number }>> => {
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.clearAccountData(accountId);
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load photos from JSON file, filtering to only include photos that exist on disk
+ipcMain.handle(
+  'load-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<Photo[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const jsonPath = path.join(accountDir, `${accountId}_photos.json`);
+
+      if (!(await fs.pathExists(jsonPath))) {
+        return { success: true, data: [] };
+      }
+
+      const rawPhotos: Photo[] = await fs.readJson(jsonPath);
+      const photos = rawPhotos.map(normalizePhotoRecord);
+
+      // Pre-scan directories once to avoid thousands of individual path checks
+      const photosDir = path.join(accountDir, 'photos');
+      const feedDir = path.join(accountDir, 'feed');
+
+      const photoFileIds = new Set<string>();
+      const feedFileIds = new Set<string>();
+
+      if (await fs.pathExists(photosDir)) {
+        const files = await fs.readdir(photosDir);
+        for (const file of files) {
+          const id = path.parse(file).name;
+          if (id) {
+            photoFileIds.add(id);
+          }
+        }
+      }
+
+      if (await fs.pathExists(feedDir)) {
+        const files = await fs.readdir(feedDir);
+        for (const file of files) {
+          const id = path.parse(file).name;
+          if (id) {
+            feedFileIds.add(id);
+          }
+        }
+      }
+
+      const photosWithFiles: Photo[] = [];
+      for (const photo of photos) {
+        if (!photo.Id) {
+          continue;
+        }
+
+        const photoId = photo.Id.toString();
+
+        let localFilePath: string | undefined;
+        if (photoFileIds.has(photoId)) {
+          localFilePath = path.join(photosDir, `${photoId}.jpg`);
+        } else if (feedFileIds.has(photoId)) {
+          localFilePath = path.join(feedDir, `${photoId}.jpg`);
+        }
+
+        if (localFilePath) {
+          photosWithFiles.push({
+            ...photo,
+            localFilePath,
+          });
+        }
+      }
+
+      return { success: true, data: photosWithFiles };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load feed photos from JSON file, filtering to only include photos that exist on disk
+ipcMain.handle(
+  'load-feed-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<Photo[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const feedJsonPath = path.join(accountDir, `${accountId}_feed.json`);
+
+      if (!(await fs.pathExists(feedJsonPath))) {
+        return { success: true, data: [] };
+      }
+
+      const feedPhotos: Photo[] = (await fs.readJson(feedJsonPath)).map(
+        normalizePhotoRecord
+      );
+
+      // Pre-scan directories once to avoid thousands of individual path checks
+      const feedDir = path.join(accountDir, 'feed');
+      const photosDir = path.join(accountDir, 'photos');
+
+      const feedFileIds = new Set<string>();
+      const photoFileIds = new Set<string>();
+
+      if (await fs.pathExists(feedDir)) {
+        const files = await fs.readdir(feedDir);
+        for (const file of files) {
+          const id = path.parse(file).name;
+          if (id) {
+            feedFileIds.add(id);
+          }
+        }
+      }
+
+      if (await fs.pathExists(photosDir)) {
+        const files = await fs.readdir(photosDir);
+        for (const file of files) {
+          const id = path.parse(file).name;
+          if (id) {
+            photoFileIds.add(id);
+          }
+        }
+      }
+
+      const photosWithFiles: Photo[] = [];
+      for (const photo of feedPhotos) {
+        if (!photo.Id) {
+          continue;
+        }
+
+        const photoId = photo.Id.toString();
+
+        let localFilePath: string | undefined;
+        if (feedFileIds.has(photoId)) {
+          localFilePath = path.join(feedDir, `${photoId}.jpg`);
+        } else if (photoFileIds.has(photoId)) {
+          localFilePath = path.join(photosDir, `${photoId}.jpg`);
+        }
+
+        if (localFilePath) {
+          photosWithFiles.push({
+            ...photo,
+            localFilePath,
+          });
+        }
+      }
+
+      return { success: true, data: photosWithFiles };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-profile-history-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<Photo[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const profileHistoryJsonPath = path.join(
+        accountDir,
+        `${accountId}_profile_history.json`
+      );
+
+      if (!(await fs.pathExists(profileHistoryJsonPath))) {
+        return { success: true, data: [] };
+      }
+
+      const profileHistoryPhotos: Photo[] = (
+        await fs.readJson(profileHistoryJsonPath)
+      ).map(normalizePhotoRecord);
+      const profileHistoryDir = path.join(accountDir, 'profile-history');
+
+      const profileHistoryFileIds = new Set<string>();
+      if (await fs.pathExists(profileHistoryDir)) {
+        const files = await fs.readdir(profileHistoryDir);
+        for (const file of files) {
+          const id = path.parse(file).name;
+          if (id) {
+            profileHistoryFileIds.add(id);
+          }
+        }
+      }
+
+      const photosWithFiles: Photo[] = [];
+      for (const photo of profileHistoryPhotos) {
+        if (!photo.Id) {
+          continue;
+        }
+
+        const photoId = photo.Id.toString();
+        if (!profileHistoryFileIds.has(photoId)) {
+          continue;
+        }
+
+        photosWithFiles.push({
+          ...photo,
+          localFilePath: path.join(profileHistoryDir, `${photoId}.jpg`),
+        });
+      }
+
+      return { success: true, data: photosWithFiles };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// List available accounts with metadata
+ipcMain.handle(
+  'list-available-accounts',
+  async (): Promise<
+    ApiResponse<
+      Array<{
+        accountId: string;
+        hasPhotos: boolean;
+        hasFeed: boolean;
+        hasProfileHistory: boolean;
+        photoCount: number;
+        feedCount: number;
+        profileHistoryCount: number;
+        displayLabel?: string;
+      }>
+    >
+  > => {
+    try {
+      const accounts = await recNetService.listAvailableAccounts();
+      return { success: true, data: accounts };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'list-available-rooms',
+  async (): Promise<ApiResponse<AvailableRoom[]>> => {
+    try {
+      const rooms = await recNetService.listAvailableRooms();
+      return { success: true, data: rooms };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'list-available-events',
+  async (
+    event: IpcMainInvokeEvent,
+    creatorAccountId?: string
+  ): Promise<ApiResponse<AvailableEvent[]>> => {
+    try {
+      const events = await recNetService.listAvailableEvents(creatorAccountId);
+      return { success: true, data: events };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'list-available-event-creators',
+  async (): Promise<ApiResponse<AvailableEventCreator[]>> => {
+    try {
+      const creators = await recNetService.listAvailableEventCreators();
+      return { success: true, data: creators };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-room-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params:
+      | string
+      | {
+          roomId: string;
+          offset?: number;
+          limit?: number;
+          sortBy?: PhotoPreviewSort;
+          searchQuery?: string;
+          favoriteIds?: string[];
+          anchorPhotoId?: string;
+          anchorIndexInPage?: number;
+          preferLatest?: boolean;
+        }
+  ): Promise<ApiResponse<PhotoPageResult>> => {
+    try {
+      const roomId =
+        typeof params === 'string' ? params : String(params.roomId ?? '');
+      const offset =
+        typeof params === 'string'
+          ? 0
+          : Math.max(0, Math.floor(params.offset ?? 0));
+      const limit =
+        typeof params === 'string'
+          ? 100
+          : Math.min(500, Math.max(1, Math.floor(params.limit ?? 100)));
+      const sortBy =
+        typeof params === 'string' ? 'oldest-to-newest' : params.sortBy;
+      const searchQuery =
+        typeof params === 'string' ? undefined : params.searchQuery;
+      const favoriteIds =
+        typeof params === 'string' ? undefined : params.favoriteIds;
+      const anchorPhotoId =
+        typeof params === 'string' ? undefined : normalizeId(params.anchorPhotoId);
+      const anchorIndexInPage =
+        typeof params === 'string'
+          ? 0
+          : Math.max(0, Math.floor(params.anchorIndexInPage ?? 0));
+      const preferLatest =
+        typeof params === 'string' ? false : params.preferLatest === true;
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: { photos: [], total: 0, offset, limit } };
+      }
+      const roomDir = path.join(root, 'rooms', roomId);
+      const jsonPath = path.join(roomDir, `${roomId}_photos.json`);
+
+      if (!(await fs.pathExists(jsonPath))) {
+        return { success: true, data: { photos: [], total: 0, offset, limit } };
+      }
+
+      const rawPhotos: Photo[] = await fs.readJson(jsonPath);
+      const photos = Array.isArray(rawPhotos)
+        ? rawPhotos.map(normalizePhotoRecord)
+        : [];
+      const photosDir = path.join(roomDir, 'photos');
+      const photoFilePathById = new Map<string, string>();
+
+      if (await fs.pathExists(photosDir)) {
+        const files = await fs.readdir(photosDir);
+        for (const file of files) {
+          if (path.extname(file).toLowerCase() !== '.jpg') {
+            continue;
+          }
+          const id = path.parse(file).name;
+          if (id) {
+            photoFilePathById.set(id, path.join(photosDir, file));
+          }
+        }
+      }
+
+      const photosWithLocalPaths: Photo[] = [];
+      for (const photo of photos) {
+        const photoId = normalizeId(photo.Id);
+        const localFilePath = photoId
+          ? photoFilePathById.get(photoId)
+          : undefined;
+        if (!localFilePath) {
+          continue;
+        }
+        photosWithLocalPaths.push({
+          ...photo,
+          localFilePath,
+        });
+      }
+      const filteredPhotos = filterPhotosForPreview(
+        sortPhotosForPreview(photosWithLocalPaths, sortBy),
+        searchQuery,
+        favoriteIds
+      );
+      let resolvedOffset = offset;
+      if (preferLatest) {
+        resolvedOffset =
+          sortBy === 'newest-to-oldest'
+            ? 0
+            : Math.max(0, filteredPhotos.length - limit);
+      } else if (anchorPhotoId) {
+        const anchorIndex = filteredPhotos.findIndex(
+          photo => normalizeId(photo.Id) === anchorPhotoId
+        );
+        if (anchorIndex >= 0) {
+          resolvedOffset =
+            Math.floor(
+              Math.max(0, anchorIndex - anchorIndexInPage) / limit
+            ) * limit;
+        }
+      }
+      resolvedOffset = Math.min(
+        Math.max(0, resolvedOffset),
+        Math.max(0, filteredPhotos.length - 1)
+      );
+
+      return {
+        success: true,
+        data: {
+          photos: filteredPhotos.slice(resolvedOffset, resolvedOffset + limit),
+          total: filteredPhotos.length,
+          offset: resolvedOffset,
+          limit,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-room-accounts-data',
+  async (
+    event: IpcMainInvokeEvent,
+    roomId: string
+  ): Promise<ApiResponse<PlayerResult[]>> => {
+    try {
+      const data = await recNetService.loadRoomAccountsData(roomId);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-room-rooms-data',
+  async (
+    event: IpcMainInvokeEvent,
+    roomId: string
+  ): Promise<ApiResponse<RoomDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const jsonPath = path.join(root, 'rooms', roomId, `${roomId}_rooms.json`);
+      if (!(await fs.pathExists(jsonPath))) {
+        return { success: true, data: [] };
+      }
+      const data: RoomDto[] = (await fs.readJson(jsonPath)).map(
+        normalizeRoomRecord
+      );
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-room-events-data',
+  async (
+    event: IpcMainInvokeEvent,
+    roomId: string
+  ): Promise<ApiResponse<EventDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const jsonPath = path.join(
+        root,
+        'rooms',
+        roomId,
+        `${roomId}_events.json`
+      );
+      if (!(await fs.pathExists(jsonPath))) {
+        return { success: true, data: [] };
+      }
+      const data: EventDto[] = (await fs.readJson(jsonPath)).map(
+        normalizeEventRecord
+      );
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-room-image-comments-data',
+  async (
+    event: IpcMainInvokeEvent,
+    roomId: string
+  ): Promise<ApiResponse<ImageCommentDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const jsonPath = path.join(
+        root,
+        'rooms',
+        roomId,
+        `${roomId}_image_comments.json`
+      );
+      if (!(await fs.pathExists(jsonPath))) {
+        return { success: true, data: [] };
+      }
+      const raw: ImageCommentDto[] = await fs.readJson(jsonPath);
+      const data = Array.isArray(raw)
+        ? raw.map(normalizeImageCommentRecord)
+        : [];
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-album-photos',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LoadEventAlbumPhotosParams
+  ): Promise<ApiResponse<Photo[]>> => {
+    try {
+      const photos = await recNetService.loadEventAlbumPhotos(params);
+      return { success: true, data: photos };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-album-accounts-data',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LoadEventAlbumPhotosParams
+  ): Promise<ApiResponse<PlayerResult[]>> => {
+    try {
+      const data = await recNetService.loadEventAlbumAccountsData(params);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-album-rooms-data',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LoadEventAlbumPhotosParams
+  ): Promise<ApiResponse<RoomDto[]>> => {
+    try {
+      const data = await recNetService.loadEventAlbumRoomsData(params);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-album-events-data',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LoadEventAlbumPhotosParams
+  ): Promise<ApiResponse<EventDto[]>> => {
+    try {
+      const data = await recNetService.loadEventAlbumEventsData(params);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-album-image-comments-data',
+  async (
+    event: IpcMainInvokeEvent,
+    params: LoadEventAlbumPhotosParams
+  ): Promise<ApiResponse<ImageCommentDto[]>> => {
+    try {
+      const data = await recNetService.loadEventAlbumImageCommentsData(params);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'load-event-albums-for-creator',
+  async (
+    event: IpcMainInvokeEvent,
+    creatorAccountId: string
+  ): Promise<ApiResponse<AvailableEvent[]>> => {
+    try {
+      const events =
+        await recNetService.loadEventAlbumsForCreator(creatorAccountId);
+      return { success: true, data: events };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load account data from JSON file
+ipcMain.handle(
+  'load-accounts-data',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<PlayerResult[]>> => {
+    try {
+      const data = await recNetService.loadUserAccountsData(accountId);
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load room data from JSON file
+ipcMain.handle(
+  'load-rooms-data',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<RoomDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const roomsJsonPath = path.join(accountDir, `${accountId}_rooms.json`);
+
+      if (await fs.pathExists(roomsJsonPath)) {
+        const roomsData: RoomDto[] = (await fs.readJson(roomsJsonPath)).map(
+          normalizeRoomRecord
+        );
+        return { success: true, data: roomsData };
+      } else {
+        return { success: true, data: [] };
+      }
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load event data from JSON file
+ipcMain.handle(
+  'load-events-data',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<EventDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const eventsJsonPath = path.join(accountDir, `${accountId}_events.json`);
+
+      if (await fs.pathExists(eventsJsonPath)) {
+        const eventsData: EventDto[] = (await fs.readJson(eventsJsonPath)).map(
+          normalizeEventRecord
+        );
+        return { success: true, data: eventsData };
+      } else {
+        return { success: true, data: [] };
+      }
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Load image comments metadata from JSON file
+ipcMain.handle(
+  'load-image-comments-data',
+  async (
+    event: IpcMainInvokeEvent,
+    accountId: string
+  ): Promise<ApiResponse<ImageCommentDto[]>> => {
+    try {
+      const settings = await recNetService.getSettings();
+      const root = (settings.resolvedOutputRoot ?? '').trim();
+      if (!root) {
+        return { success: true, data: [] };
+      }
+      const accountDir = path.join(root, accountId);
+      const imageCommentsJsonPath = path.join(
+        accountDir,
+        `${accountId}_image_comments.json`
+      );
+
+      if (await fs.pathExists(imageCommentsJsonPath)) {
+        const raw: ImageCommentDto[] = await fs.readJson(imageCommentsJsonPath);
+        const commentsData = Array.isArray(raw)
+          ? raw.map(normalizeImageCommentRecord)
+          : [];
+        return { success: true, data: commentsData };
+      }
+      return { success: true, data: [] };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+const getFavoritesPath = (): string => {
+  const userDataPath = app.getPath('userData');
+  return path.join(userDataPath, 'favorites.json');
+};
+
+ipcMain.handle('get-favorites', async (): Promise<ApiResponse<string[]>> => {
+  try {
+    const favoritesPath = getFavoritesPath();
+    if (await fs.pathExists(favoritesPath)) {
+      const favoritesArray: string[] = await fs.readJson(favoritesPath);
+      return { success: true, data: favoritesArray };
+    } else {
+      return { success: true, data: [] };
+    }
+  } catch (error) {
+    return { success: false, error: (error as Error).message };
+  }
+});
+
+ipcMain.handle(
+  'toggle-favorite',
+  async (
+    event: IpcMainInvokeEvent,
+    photoId: string
+  ): Promise<ApiResponse<boolean>> => {
+    try {
+      const favoritesPath = getFavoritesPath();
+      let favorites: Set<string>;
+
+      if (await fs.pathExists(favoritesPath)) {
+        const favoritesArray: string[] = await fs.readJson(favoritesPath);
+        favorites = new Set(favoritesArray);
+      } else {
+        favorites = new Set<string>();
+      }
+
+      const isFavorite = favorites.has(photoId);
+      if (isFavorite) {
+        favorites.delete(photoId);
+      } else {
+        favorites.add(photoId);
+      }
+
+      // Ensure directory exists
+      await fs.ensureDir(path.dirname(favoritesPath));
+
+      // Save as array for JSON serialization
+      await fs.writeJson(favoritesPath, Array.from(favorites), { spaces: 2 });
+
+      return { success: true, data: !isFavorite };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'is-favorite',
+  async (
+    event: IpcMainInvokeEvent,
+    photoId: string
+  ): Promise<ApiResponse<boolean>> => {
+    try {
+      const favoritesPath = getFavoritesPath();
+      if (await fs.pathExists(favoritesPath)) {
+        const favoritesArray: string[] = await fs.readJson(favoritesPath);
+        const favorites = new Set(favoritesArray);
+        return { success: true, data: favorites.has(photoId) };
+      } else {
+        return { success: true, data: false };
+      }
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+// Allowlist of URL prefixes that the renderer may open in the system browser
+const ALLOWED_EXTERNAL_URL_PREFIXES = [
+  'https://rec.net/',
+  'https://github.com/Winston-Saarloos/rr-image-downloader/',
+];
+
+// Open external URL in system browser
+ipcMain.handle(
+  'open-external',
+  async (event: IpcMainInvokeEvent, url: string): Promise<void> => {
+    if (getViewerOnlyNetworkError()) {
+      throw new Error(VIEWER_ONLY_MODE_ERROR);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`Invalid URL: ${url}`);
+    }
+    if (parsed.protocol !== 'https:') {
+      throw new Error(`Blocked non-HTTPS URL: ${url}`);
+    }
+    if (
+      !ALLOWED_EXTERNAL_URL_PREFIXES.some(prefix =>
+        parsed.href.startsWith(prefix)
+      )
+    ) {
+      throw new Error(`URL not in allowlist: ${url}`);
+    }
+    await shell.openExternal(parsed.href);
+  }
+);
+
+ipcMain.handle(
+  'open-path-in-explorer',
+  async (_event: IpcMainInvokeEvent, targetPath: string) => {
+    const resolved = path.resolve(targetPath);
+    if (!(await fs.pathExists(resolved))) {
+      return { success: false as const, error: 'Path does not exist' };
+    }
+    const errMsg = await shell.openPath(resolved);
+    if (errMsg) {
+      return { success: false as const, error: errMsg };
+    }
+    return { success: true as const };
+  }
+);
+
+ipcMain.handle(
+  'reveal-path-in-explorer',
+  async (_event: IpcMainInvokeEvent, targetPath: string) => {
+    const resolved = path.resolve(targetPath);
+    if (!(await fs.pathExists(resolved))) {
+      return { success: false as const, error: 'Path does not exist' };
+    }
+
+    shell.showItemInFolder(resolved);
+    return { success: true as const };
+  }
+);
+
+// Auto-updater IPC handlers
+ipcMain.handle('check-for-updates', async (): Promise<void> => {
+  if (!isDev) {
+    try {
+      await autoUpdater.checkForUpdates();
+    } catch (error) {
+      console.error('Error checking for updates:', error);
+      throw error;
+    }
+  }
+});
+
+ipcMain.handle('download-update', async (): Promise<void> => {
+  if (!isDev) {
+    try {
+      await autoUpdater.downloadUpdate();
+    } catch (error) {
+      console.error('Error downloading update:', error);
+      throw error;
+    }
+  }
+});
+
+ipcMain.handle('install-update', async (): Promise<void> => {
+  if (!isDev) {
+    autoUpdater.quitAndInstall(false, true);
+  }
+});
+
+ipcMain.handle('get-app-version', async (): Promise<string> => {
+  return app.getVersion();
+});
+
+// Window controls
+ipcMain.handle('window-minimize', () => {
+  if (mainWindow) {
+    mainWindow.minimize();
+  }
+});
+
+ipcMain.handle('window-maximize', () => {
+  if (mainWindow) {
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+  }
+});
+
+ipcMain.handle('window-close', () => {
+  if (mainWindow) {
+    mainWindow.close();
+  }
+});
+
+ipcMain.handle('window-is-maximized', () => {
+  return mainWindow ? mainWindow.isMaximized() : false;
+});
