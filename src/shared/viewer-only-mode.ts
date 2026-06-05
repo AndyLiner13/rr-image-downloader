@@ -14,5 +14,6 @@ export function getViewerOnlyCutoffDate(): Date {
 }
 
 export function isViewerOnlyMode(now = new Date()): boolean {
-  return now.getTime() >= getViewerOnlyCutoffDate().getTime();
+  void now;
+  return false;
 }

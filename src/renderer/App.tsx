@@ -24,10 +24,6 @@ import {
   RoomPhotoSort,
   UserFacingIncident,
 } from '../shared/types';
-import {
-  getViewerOnlyCutoffDate,
-  isViewerOnlyMode,
-} from '../shared/viewer-only-mode';
 import { CustomTitleBar } from './components/CustomTitleBar';
 import { DownloadPanel } from './components/DownloadPanel';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -71,16 +67,13 @@ interface PendingDownloadPreflight {
 const EMPTY_DOWNLOAD_STEP = 'Nothing to download';
 const CLEAN_DOWNLOAD_FOLLOW_UP =
   'If you take more photos in Rec Room, come back and run this download again. The app will only grab anything new.';
-const VIEWER_ONLY_RECHECK_MS = 60 * 60 * 1000;
 const DEFAULT_MYROOMS_MANIFEST_PATH = '';
 
 /** Set to true to allow starting a library move from the debug menu. */
 const LIBRARY_MOVE_ENABLED = false;
 
 function App() {
-  const [viewerOnlyMode, setViewerOnlyMode] = useState(() =>
-    isViewerOnlyMode()
-  );
+  const viewerOnlyMode = false;
   const [settings, setSettings] = useState<RecNetSettings>({
     outputRoot: '',
     cdnBase: DEFAULT_CDN_BASE,
@@ -107,7 +100,7 @@ function App() {
   const [currentRoomId, setCurrentRoomId] = useState<string>('');
   const [currentEventCreatorId, setCurrentEventCreatorId] =
     useState<string>('');
-  const [libraryMode, setLibraryMode] = useState<LibraryMode>('user');
+  const [libraryMode, setLibraryMode] = useState<LibraryMode>('room');
   const [downloadPanelOpen, setDownloadPanelOpen] = useState(false);
   const [eventDownloadPanelPrefill, setEventDownloadPanelPrefill] =
     useState<EventDownloadPanelPrefill | null>(null);
@@ -186,29 +179,6 @@ function App() {
     loadSettings();
     setupProgressMonitoring();
   }, []);
-
-  useEffect(() => {
-    if (viewerOnlyMode) {
-      setDownloadPanelOpen(false);
-      setPendingPreflight(null);
-      if (isDownloading) {
-        void window.electronAPI?.cancelOperation?.();
-      }
-      return;
-    }
-
-    const delayMs = Math.min(
-      Math.max(getViewerOnlyCutoffDate().getTime() - Date.now(), 0),
-      VIEWER_ONLY_RECHECK_MS
-    );
-    const timeout = window.setTimeout(() => {
-      setViewerOnlyMode(isViewerOnlyMode());
-      setDownloadPanelOpen(false);
-      setPendingPreflight(null);
-    }, delayMs);
-
-    return () => window.clearTimeout(timeout);
-  }, [isDownloading, viewerOnlyMode]);
 
   useEffect(() => {
     if (!window.electronAPI?.onMetadataSyncState) {

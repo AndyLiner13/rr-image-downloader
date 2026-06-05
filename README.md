@@ -27,7 +27,7 @@ RR Image Downloader is an Electron + React desktop app for saving Rec Room / Rec
 
 1. Launch `RR Image Downloader.exe`.
 2. Choose or verify your output folder in Settings.
-3. Select a mode from the top-left selector:
+3. The app opens to **Room Photos** by default. Select another mode from the top-left selector if needed:
    - User photos
    - Feed/profile-related photo views
    - Event photos
@@ -170,6 +170,8 @@ App settings persist at:
 ```text
 ~\.recnet-photo-downloader\settings.json
 ```
+
+The app no longer has a date-based viewer-only cutoff. Download controls remain available normally after launch, including from the default **Room Photos** tab.
 
 ## Token Notes
 

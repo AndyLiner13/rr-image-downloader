@@ -207,6 +207,7 @@ docs/BUILD.md
 *.exe
 resources/app.asar
 resources/app.asar.unpacked/
+resources/app-update.yml
 
 # Electron runtime distribution files (DLLs, PAK files, snapshots, etc.)
 *.dll

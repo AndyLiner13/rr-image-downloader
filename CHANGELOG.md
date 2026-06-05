@@ -17,6 +17,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.1] - 2026-06-05
+
+### Changed
+
+- The app now opens to the **Room Photos** tab by default instead of **User Photos**.
+
+### Fixed
+
+- Removed the date-based viewer-only cutoff that hid download controls and disabled download/network actions after June 6, 2026. The normal GUI and download controls now remain available.
+
+### Documentation
+
+- Updated the README usage/settings notes to document the Room Photos default and the removal of the viewer-only cutoff.
+
+## [5.0.0] - 2026-06-05
+
 ### Added
 
 #### Incremental SQLite capture store (room photo overhaul)
@@ -193,3 +209,5 @@ under [4.0.8] above describe this fork's divergence from that baseline.
 
 [4.0.7]: https://github.com/Winston-Saarloos/rr-image-downloader/releases/tag/v4.0.7
 [4.0.8]: https://github.com/AndyLiner13/rr-image-downloader/releases/tag/v4.0.8
+[5.0.0]: https://github.com/AndyLiner13/rr-image-downloader/releases/tag/v5.0.0
+[5.0.1]: https://github.com/AndyLiner13/rr-image-downloader/releases/tag/v5.0.1
