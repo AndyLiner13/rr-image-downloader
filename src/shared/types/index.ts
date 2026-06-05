@@ -388,6 +388,45 @@ export interface RoomPhotoDownloadResult {
   guidance?: string[];
 }
 
+/**
+ * Phase 2 result — fetch all related account/room/event metadata for every
+ * photo captured in a room, in a single pass (no per-page interleaving).
+ */
+export interface RoomMetadataSyncResult {
+  roomId: string;
+  roomName: string;
+  accountsFetched: number;
+  roomsFetched: number;
+  eventsFetched: number;
+  totalAccounts: number;
+  totalRooms: number;
+  totalEvents: number;
+}
+
+/**
+ * Phase 4 result — download all account profile/banner images (and the room
+ * listing image) referenced by a room's captured metadata.
+ */
+export interface RoomAssetSyncResult {
+  roomId: string;
+  roomName: string;
+  downloadedAssets: number;
+  skippedAssets: number;
+  failedAssets: number;
+}
+
+/**
+ * Phase 5 result — fetch all image comments for a room's photos, then emit the
+ * room's final JSON export artifacts from the capture database.
+ */
+export interface RoomImageCommentsResult {
+  roomId: string;
+  roomName: string;
+  imagesProcessed: number;
+  commentsFetched: number;
+  totalComments: number;
+}
+
 export interface EventDiscoveryResult {
   creatorAccountId: string;
   username: string;

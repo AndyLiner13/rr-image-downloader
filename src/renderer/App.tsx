@@ -2,31 +2,31 @@ import { ArrowUp } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CDN_BASE } from '../shared/cdnUrl';
 import {
-    DEFAULT_DOWNLOAD_SOURCE_SELECTION,
-    DownloadSourceSelection,
-    getSelectedDownloadSources,
+  DEFAULT_DOWNLOAD_SOURCE_SELECTION,
+  DownloadSourceSelection,
+  getSelectedDownloadSources,
 } from '../shared/download-sources';
 import {
-    BulkDataRefreshOptions,
-    DownloadPreflightSummary,
-    DownloadResult,
-    EventDownloadIntent,
-    EventDownloadPanelPrefill,
-    EventPhotoBatchResult,
-    LibraryMode,
-    MetadataSyncState,
-    Progress,
-    RecNetSettings,
-    RoomDto,
-    RoomPhotoBatchResult,
-    RoomPhotoDownloadResult,
-    RoomPhotoQueueProgress,
-    RoomPhotoSort,
-    UserFacingIncident,
+  BulkDataRefreshOptions,
+  DownloadPreflightSummary,
+  DownloadResult,
+  EventDownloadIntent,
+  EventDownloadPanelPrefill,
+  EventPhotoBatchResult,
+  LibraryMode,
+  MetadataSyncState,
+  Progress,
+  RecNetSettings,
+  RoomDto,
+  RoomPhotoBatchResult,
+  RoomPhotoDownloadResult,
+  RoomPhotoQueueProgress,
+  RoomPhotoSort,
+  UserFacingIncident,
 } from '../shared/types';
 import {
-    getViewerOnlyCutoffDate,
-    isViewerOnlyMode,
+  getViewerOnlyCutoffDate,
+  isViewerOnlyMode,
 } from '../shared/viewer-only-mode';
 import { CustomTitleBar } from './components/CustomTitleBar';
 import { DownloadPanel } from './components/DownloadPanel';
@@ -39,14 +39,14 @@ import { StatsDialog } from './components/StatsDialog';
 import { Button } from './components/ui/button';
 import { FavoritesProvider } from './contexts/FavoritesContext';
 import {
-    buildDownloadProgressIncident,
-    getDownloadProgressLogEntries,
+  buildDownloadProgressIncident,
+  getDownloadProgressLogEntries,
 } from './utils/downloadProgressFeedback';
 import {
-    classifyError,
-    createOutputFolderUnavailableIncident,
-    createUserIncident,
-    toOperationErrorData,
+  classifyError,
+  createOutputFolderUnavailableIncident,
+  createUserIncident,
+  toOperationErrorData,
 } from './utils/errorPresentation';
 
 interface DownloadRequestState {
@@ -817,13 +817,14 @@ function App() {
           let startSkip: number | undefined = undefined;
           let batchIndex = 0;
           let latestBatch: RoomPhotoBatchResult | null = null;
-          // Pass 1 — capture ALL photo metadata first (no image downloads).
-          // This loop drives the proven incremental/resume logic to completion
-          // so that afterwards we know the exact set of images to fetch.
+          // Phase 1 — capture ALL room photo pages (metadata only, no images,
+          // no related metadata, no comments). This loop drives the proven
+          // incremental/resume logic to completion so afterwards we know the
+          // exact set of images to fetch.
           while (!stopRoomLoopRef.current) {
             batchIndex++;
             addLog(
-              `Scanning room photo metadata (pass 1) — batch ${batchIndex}...`,
+              `Phase 1 — capturing room photo pages — batch ${batchIndex}...`,
               'info'
             );
             const batchResult: {
@@ -863,7 +864,7 @@ function App() {
                   ? ` Checked ${headPhotosChecked} latest image(s) before continuing.`
                   : '';
             addLog(
-              `Metadata batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s).${resumeDetails}`,
+              `Phase 1 batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s).${resumeDetails}`,
               'success'
             );
 
@@ -872,12 +873,36 @@ function App() {
             }
           }
 
-          // Pass 2 — download every not-yet-downloaded image in a single queue
-          // with a known total, so the progress bar is exact and each finished
-          // card appears live in the grid as its image lands.
+          // Phase 2 — capture ALL account/room/event metadata referenced by the
+          // room's photos (single pass, no images).
+          if (!stopRoomLoopRef.current) {
+            addLog('Phase 2 — capturing account metadata...', 'info');
+            const metadataResult =
+              await window.electronAPI.syncRoomRelatedMetadata({
+                roomName: username,
+                token: token.trim() || undefined,
+                forceAccountsRefresh,
+                forceRoomsRefresh,
+                forceEventsRefresh,
+              });
+            if (!metadataResult.success || !metadataResult.data) {
+              throw new Error(
+                metadataResult.error || 'Failed to capture account metadata'
+              );
+            }
+            const m = metadataResult.data;
+            addLog(
+              `Phase 2 complete: ${m.accountsFetched} account(s), ${m.roomsFetched} room(s), ${m.eventsFetched} event(s) fetched.`,
+              'success'
+            );
+          }
+
+          // Phase 3 — download every not-yet-downloaded room image in a single
+          // queue with a known total, so the progress bar is exact and each
+          // finished card appears live in the grid as its image lands.
           let downloadResult: RoomPhotoDownloadResult | null = null;
           if (!stopRoomLoopRef.current) {
-            addLog('Downloading room photos (pass 2)...', 'info');
+            addLog('Phase 3 — capturing room images...', 'info');
             const pendingResult: {
               success: boolean;
               data?: RoomPhotoDownloadResult;
@@ -896,10 +921,54 @@ function App() {
             downloadResult = pendingResult.data;
             addResult('Room Photos', downloadResult, 'success');
             addLog(
-              `Room photo download complete: ${downloadResult.downloadStats.newDownloads} downloaded, ${downloadResult.downloadStats.alreadyDownloaded} already on disk.`,
+              `Phase 3 complete: ${downloadResult.downloadStats.newDownloads} downloaded, ${downloadResult.downloadStats.alreadyDownloaded} already on disk.`,
               downloadResult.downloadStats.failedDownloads > 0
                 ? 'warning'
                 : 'success'
+            );
+          }
+
+          // Phase 4 — capture ALL account images (profile/banner) and the room
+          // listing image for the accounts referenced by this room.
+          if (!stopRoomLoopRef.current) {
+            addLog('Phase 4 — capturing account images...', 'info');
+            const accountImagesResult =
+              await window.electronAPI.syncRoomAccountImages({
+                roomName: username,
+                token: token.trim() || undefined,
+                force: forceAccountsRefresh,
+              });
+            if (!accountImagesResult.success || !accountImagesResult.data) {
+              throw new Error(
+                accountImagesResult.error || 'Failed to capture account images'
+              );
+            }
+            const a = accountImagesResult.data;
+            addLog(
+              `Phase 4 complete: ${a.downloadedAssets} downloaded, ${a.skippedAssets} skipped, ${a.failedAssets} failed.`,
+              a.failedAssets > 0 ? 'warning' : 'success'
+            );
+          }
+
+          // Phase 5 — capture ALL image comments, then write the final JSON
+          // export (with image paths, account asset paths, and comments).
+          if (!stopRoomLoopRef.current) {
+            addLog('Phase 5 — capturing image comments...', 'info');
+            const commentsResult =
+              await window.electronAPI.captureRoomImageComments({
+                roomName: username,
+                token: token.trim() || undefined,
+                forceImageCommentsRefresh,
+              });
+            if (!commentsResult.success || !commentsResult.data) {
+              throw new Error(
+                commentsResult.error || 'Failed to capture image comments'
+              );
+            }
+            const c = commentsResult.data;
+            addLog(
+              `Phase 5 complete: ${c.imagesProcessed} image(s) processed, ${c.commentsFetched} comment(s) fetched.`,
+              'success'
             );
           }
 
@@ -1594,7 +1663,55 @@ function App() {
             }
           }
 
-          // Pass 2 — download every not-yet-downloaded image for this room in a
+          // Phase 2 — capture ALL account/room/event metadata for this room.
+          if (!stopRoomLoopRef.current && latestBatch) {
+            roomPhotoQueue = {
+              ...roomPhotoQueue,
+              currentBatch: undefined,
+              currentBatchFetched: undefined,
+              currentBatchCurrent: undefined,
+              currentBatchTotal: undefined,
+              currentBatchProgress: undefined,
+              currentBatchLabel: 'Capturing account metadata',
+              currentRoomPhotosDiscovered,
+              message: `Room ${roomIndex + 1} of ${rooms.length}: capturing account metadata for ^${roomName}...`,
+            };
+            applyRoomPhotoQueueProgress(roomPhotoQueue);
+            addLog(
+              `[${roomIndex + 1}/${rooms.length}] Phase 2 — capturing account metadata for ^${roomName}...`,
+              'info'
+            );
+            const metadataResult =
+              await window.electronAPI.syncRoomRelatedMetadata({
+                roomId,
+                roomName,
+                room,
+                token: token.trim() || undefined,
+                forceAccountsRefresh,
+                forceRoomsRefresh,
+                forceEventsRefresh,
+              });
+            if (!metadataResult.success || !metadataResult.data) {
+              const errorMessage =
+                metadataResult.error || 'Failed to capture account metadata';
+              if (
+                !(
+                  stopRoomLoopRef.current &&
+                  /operation cancelled|cancelled/i.test(errorMessage)
+                )
+              ) {
+                throw new Error(errorMessage);
+              }
+            } else {
+              const m = metadataResult.data;
+              addLog(
+                `^${roomName} metadata complete: ${m.accountsFetched} account(s), ${m.roomsFetched} room(s), ${m.eventsFetched} event(s).`,
+                'success'
+              );
+            }
+          }
+
+          // Phase 3 — download every not-yet-downloaded image for this room in a
           // single queue so the total is exact and finished cards appear live.
           if (!stopRoomLoopRef.current && latestBatch) {
             roomPhotoQueue = {
@@ -1610,7 +1727,7 @@ function App() {
             };
             applyRoomPhotoQueueProgress(roomPhotoQueue);
             addLog(
-              `[${roomIndex + 1}/${rooms.length}] Downloading images for ^${roomName} (pass 2)...`,
+              `[${roomIndex + 1}/${rooms.length}] Phase 3 — capturing room images for ^${roomName}...`,
               'info'
             );
 
@@ -1655,6 +1772,90 @@ function App() {
                 downloadData.downloadStats.failedDownloads > 0
                   ? 'warning'
                   : 'success'
+              );
+            }
+          }
+
+          // Phase 4 — capture ALL account images (profile/banner) and the room
+          // listing image for the accounts referenced by this room.
+          if (!stopRoomLoopRef.current && latestBatch) {
+            roomPhotoQueue = {
+              ...roomPhotoQueue,
+              currentBatchLabel: 'Capturing account images',
+              currentRoomPhotosDiscovered,
+              message: `Room ${roomIndex + 1} of ${rooms.length}: capturing account images for ^${roomName}...`,
+            };
+            applyRoomPhotoQueueProgress(roomPhotoQueue);
+            addLog(
+              `[${roomIndex + 1}/${rooms.length}] Phase 4 — capturing account images for ^${roomName}...`,
+              'info'
+            );
+            const accountImagesResult =
+              await window.electronAPI.syncRoomAccountImages({
+                roomId,
+                roomName,
+                room,
+                token: token.trim() || undefined,
+                force: forceAccountsRefresh,
+              });
+            if (!accountImagesResult.success || !accountImagesResult.data) {
+              const errorMessage =
+                accountImagesResult.error || 'Failed to capture account images';
+              if (
+                !(
+                  stopRoomLoopRef.current &&
+                  /operation cancelled|cancelled/i.test(errorMessage)
+                )
+              ) {
+                throw new Error(errorMessage);
+              }
+            } else {
+              const a = accountImagesResult.data;
+              addLog(
+                `^${roomName} account images complete: ${a.downloadedAssets} downloaded, ${a.skippedAssets} skipped, ${a.failedAssets} failed.`,
+                a.failedAssets > 0 ? 'warning' : 'success'
+              );
+            }
+          }
+
+          // Phase 5 — capture ALL image comments, then write the final JSON
+          // export (with image paths, account asset paths, and comments).
+          if (!stopRoomLoopRef.current && latestBatch) {
+            roomPhotoQueue = {
+              ...roomPhotoQueue,
+              currentBatchLabel: 'Capturing image comments',
+              currentRoomPhotosDiscovered,
+              message: `Room ${roomIndex + 1} of ${rooms.length}: capturing image comments for ^${roomName}...`,
+            };
+            applyRoomPhotoQueueProgress(roomPhotoQueue);
+            addLog(
+              `[${roomIndex + 1}/${rooms.length}] Phase 5 — capturing image comments for ^${roomName}...`,
+              'info'
+            );
+            const commentsResult =
+              await window.electronAPI.captureRoomImageComments({
+                roomId,
+                roomName,
+                room,
+                token: token.trim() || undefined,
+                forceImageCommentsRefresh,
+              });
+            if (!commentsResult.success || !commentsResult.data) {
+              const errorMessage =
+                commentsResult.error || 'Failed to capture image comments';
+              if (
+                !(
+                  stopRoomLoopRef.current &&
+                  /operation cancelled|cancelled/i.test(errorMessage)
+                )
+              ) {
+                throw new Error(errorMessage);
+              }
+            } else {
+              const c = commentsResult.data;
+              addLog(
+                `^${roomName} comments complete: ${c.imagesProcessed} image(s) processed, ${c.commentsFetched} comment(s) fetched.`,
+                'success'
               );
             }
           }

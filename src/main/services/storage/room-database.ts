@@ -666,6 +666,24 @@ export class RoomDatabase {
     });
   }
 
+  /** Remove all stored comments for the given image IDs (used by force-refresh). */
+  deleteImageCommentsForImageIds(imageIds: Iterable<string>): void {
+    const ids = Array.from(imageIds)
+      .map(id => normalizeIdValue(id))
+      .filter((id): id is string => !!id);
+    if (ids.length === 0) {
+      return;
+    }
+    const stmt = this.db.prepare(
+      `DELETE FROM image_comments WHERE image_id = ?`
+    );
+    this.transaction(() => {
+      for (const id of ids) {
+        stmt.run(id);
+      }
+    });
+  }
+
   /** Record that an image's comments have been fetched (for resumable passes). */
   markCommentsFetched(imageId: string, count: number): void {
     const id = normalizeIdValue(imageId);

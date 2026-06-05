@@ -32,7 +32,10 @@ import {
     ProfileHistoryCollectionResult,
     Progress,
     RecNetSettings,
+    RoomAssetSyncResult,
     RoomDto,
+    RoomImageCommentsResult,
+    RoomMetadataSyncResult,
     RoomPhotoBatchResult,
     RoomPhotoDownloadResult,
     RoomPhotoSort,
@@ -264,6 +267,32 @@ interface DownloadRoomPendingImagesParams {
   roomId?: string;
   room?: RoomDto;
   token?: string;
+}
+
+interface SyncRoomRelatedMetadataParams {
+  roomName?: string;
+  roomId?: string;
+  room?: RoomDto;
+  token?: string;
+  forceAccountsRefresh?: boolean;
+  forceRoomsRefresh?: boolean;
+  forceEventsRefresh?: boolean;
+}
+
+interface SyncRoomAccountImagesParams {
+  roomName?: string;
+  roomId?: string;
+  room?: RoomDto;
+  token?: string;
+  force?: boolean;
+}
+
+interface CaptureRoomImageCommentsParams {
+  roomName?: string;
+  roomId?: string;
+  room?: RoomDto;
+  token?: string;
+  forceImageCommentsRefresh?: boolean;
 }
 
 interface DiscoverEventsForUsernameParams {
@@ -761,6 +790,14 @@ app.on('window-all-closed', () => {
   }
 });
 
+app.on('before-quit', () => {
+  try {
+    recNetService?.dispose();
+  } catch {
+    /* best effort on shutdown */
+  }
+});
+
 async function getOutputWriteBlockedError(): Promise<string | null> {
   return recNetService.getOutputConfigurationError();
 }
@@ -1068,6 +1105,72 @@ ipcMain.handle(
         return { success: false, error: outputErr };
       }
       const result = await recNetService.downloadRoomPendingImages(params);
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'sync-room-related-metadata',
+  async (
+    _event: IpcMainInvokeEvent,
+    params: SyncRoomRelatedMetadataParams
+  ): Promise<ApiResponse<RoomMetadataSyncResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.syncRoomRelatedMetadata(params);
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'sync-room-account-images',
+  async (
+    _event: IpcMainInvokeEvent,
+    params: SyncRoomAccountImagesParams
+  ): Promise<ApiResponse<RoomAssetSyncResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.syncRoomAccountImages(params);
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'capture-room-image-comments',
+  async (
+    _event: IpcMainInvokeEvent,
+    params: CaptureRoomImageCommentsParams
+  ): Promise<ApiResponse<RoomImageCommentsResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.captureRoomImageComments(params);
       return { success: true, data: result };
     } catch (error) {
       return { success: false, error: (error as Error).message };

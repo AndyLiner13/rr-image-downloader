@@ -24,6 +24,12 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.invoke('download-room-photo-batch', params),
   downloadRoomPendingImages: params =>
     ipcRenderer.invoke('download-room-pending-images', params),
+  syncRoomRelatedMetadata: params =>
+    ipcRenderer.invoke('sync-room-related-metadata', params),
+  syncRoomAccountImages: params =>
+    ipcRenderer.invoke('sync-room-account-images', params),
+  captureRoomImageComments: params =>
+    ipcRenderer.invoke('capture-room-image-comments', params),
   loadMyRoomsManifest: params =>
     ipcRenderer.invoke('load-my-rooms-manifest', params ?? {}),
   selectMyRoomsJson: () => ipcRenderer.invoke('select-my-rooms-json'),

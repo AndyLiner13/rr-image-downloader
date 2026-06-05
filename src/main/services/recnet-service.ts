@@ -5,37 +5,40 @@ import * as path from 'path';
 import { buildCdnImageUrl, DEFAULT_CDN_BASE } from '../../shared/cdnUrl';
 import { clampConcurrencyForDelay } from '../../shared/concurrency';
 import {
-    DownloadSource,
-    DownloadSourceSelection,
-    getSelectedDownloadSources,
+  DownloadSource,
+  DownloadSourceSelection,
+  getSelectedDownloadSources,
 } from '../../shared/download-sources';
 import {
-    AccountInfo,
-    AvailableEvent,
-    AvailableEventCreator,
-    AvailableRoom,
-    BulkDataRefreshOptions,
-    CollectionResult,
-    DownloadPreflightSourceSummary,
-    DownloadPreflightSummary,
-    DownloadResult,
-    DownloadResultItem,
-    DownloadStats,
-    EventDiscoveryResult,
-    EventPhotoBatchResult,
-    IterationDetail,
-    LibraryMoveProgress,
-    LibraryMoveResult,
-    MetadataSyncResult,
-    MetadataSyncState,
-    Photo,
-    ProfileHistoryAccessResult,
-    ProfileHistoryCollectionResult,
-    Progress,
-    RecNetSettings,
-    RoomPhotoBatchResult,
-    RoomPhotoDownloadResult,
-    RoomPhotoSort,
+  AccountInfo,
+  AvailableEvent,
+  AvailableEventCreator,
+  AvailableRoom,
+  BulkDataRefreshOptions,
+  CollectionResult,
+  DownloadPreflightSourceSummary,
+  DownloadPreflightSummary,
+  DownloadResult,
+  DownloadResultItem,
+  DownloadStats,
+  EventDiscoveryResult,
+  EventPhotoBatchResult,
+  IterationDetail,
+  LibraryMoveProgress,
+  LibraryMoveResult,
+  MetadataSyncResult,
+  MetadataSyncState,
+  Photo,
+  ProfileHistoryAccessResult,
+  ProfileHistoryCollectionResult,
+  Progress,
+  RecNetSettings,
+  RoomAssetSyncResult,
+  RoomImageCommentsResult,
+  RoomMetadataSyncResult,
+  RoomPhotoBatchResult,
+  RoomPhotoDownloadResult,
+  RoomPhotoSort,
 } from '../../shared/types';
 import { EventDto } from '../models/EventDto';
 import { ImageCommentDto } from '../models/ImageCommentDto';
@@ -45,10 +48,10 @@ import { ProfileHistoryImageDto } from '../models/ProfileHistoryImageDto';
 import { RoomDto } from '../models/RoomDto';
 import { Semaphore } from '../utils/semaphore';
 import {
-    LibraryMoveCancelledError,
-    pathsEffectivelyEqual,
-    removePartialLibraryCopy,
-    runLibraryMove,
+  LibraryMoveCancelledError,
+  pathsEffectivelyEqual,
+  removePartialLibraryCopy,
+  runLibraryMove,
 } from './library-move';
 import { AccountsController } from './recnet/accounts-controller';
 import { EventsController } from './recnet/events-controller';
@@ -56,6 +59,7 @@ import { RecNetHttpClient } from './recnet/http-client';
 import { ImageCommentsController } from './recnet/image-comments-controller';
 import { PhotosController } from './recnet/photos-controller';
 import { RoomsController } from './recnet/rooms-controller';
+import { GlobalDatabase, type AccountAssets } from './storage/global-database';
 import { RoomDatabase } from './storage/room-database';
 
 type MetadataSyncProgress = Omit<MetadataSyncState, 'phase'>;
@@ -315,8 +319,6 @@ const EVENT_PHOTO_PAGE_SIZE = 100;
 const IMAGE_COMMENT_REQUEST_MIN_INTERVAL_MS = 250;
 const METADATA_SUBDIR = 'metadata';
 const METADATA_MANIFEST_FILE = 'metadata.json';
-const ACCOUNT_METADATA_MANIFEST_FILE = 'accounts-metadata.json';
-const ACCOUNT_METADATA_RECORDS_FILE = 'accounts.json';
 
 /** CDN image entry written next to files under metadata/ */
 type MetadataImageEntryV1 = {
@@ -532,6 +534,15 @@ export class RecNetService extends EventEmitter {
   /** Serializes image-comment HTTP calls across overlapping downloads. */
   private imageCommentRequestGate: Promise<void> = Promise.resolve();
   private lastImageCommentRequestStartedAt = 0;
+  /**
+   * Global SQLite store (`<outputRoot>/data.sqlite`) — the cross-folder working
+   * cache for account records, account image asset manifests, rooms and events.
+   * Replaces the old `metadata/accounts.json` / `metadata/accounts-metadata.json`
+   * JSON caches. Opened lazily; re-opened if the output root changes.
+   */
+  private globalDb: GlobalDatabase | null = null;
+  private globalDbRoot: string | null = null;
+  private globalDbOpenPromise: Promise<GlobalDatabase> | null = null;
 
   constructor() {
     super();
@@ -3396,38 +3407,84 @@ export class RecNetService extends EventEmitter {
     return path.join(this.getResolvedOutputRoot(), METADATA_SUBDIR);
   }
 
-  private getCentralAccountMetadataManifestPath(): string {
-    return path.join(
-      this.getRootMetadataDirectory(),
-      ACCOUNT_METADATA_MANIFEST_FILE
-    );
+  /**
+   * Open (lazily) the global SQLite store at the current output root. If the
+   * output root has changed since the last open, the previous handle is closed
+   * and a new one is opened for the new location.
+   */
+  private async getGlobalDatabase(): Promise<GlobalDatabase> {
+    const root = this.getResolvedOutputRoot();
+
+    if (this.globalDb && this.globalDbRoot === root) {
+      return this.globalDb;
+    }
+
+    // Output root changed (or first open): drop any stale handle.
+    if (this.globalDb && this.globalDbRoot !== root) {
+      try {
+        this.globalDb.close();
+      } catch {
+        /* ignore */
+      }
+      this.globalDb = null;
+      this.globalDbRoot = null;
+      this.globalDbOpenPromise = null;
+    }
+
+    if (this.globalDbOpenPromise && this.globalDbRoot === root) {
+      return this.globalDbOpenPromise;
+    }
+
+    this.globalDbRoot = root;
+    this.globalDbOpenPromise = (async () => {
+      const db = await GlobalDatabase.open(root);
+      this.globalDb = db;
+      return db;
+    })();
+
+    try {
+      return await this.globalDbOpenPromise;
+    } catch (error) {
+      this.globalDbOpenPromise = null;
+      this.globalDbRoot = null;
+      throw error;
+    }
   }
 
-  private getCentralAccountRecordsPath(): string {
-    return path.join(
-      this.getRootMetadataDirectory(),
-      ACCOUNT_METADATA_RECORDS_FILE
-    );
+  /** Close the global SQLite store (checkpointing WAL). Safe to call repeatedly. */
+  private closeGlobalDatabase(): void {
+    if (this.globalDb) {
+      try {
+        this.globalDb.close();
+      } catch (error) {
+        console.log(
+          'Failed to close global database:',
+          (error as Error).message
+        );
+      }
+    }
+    this.globalDb = null;
+    this.globalDbRoot = null;
+    this.globalDbOpenPromise = null;
+  }
+
+  /** Release resources held by the service (e.g. on app shutdown). */
+  dispose(): void {
+    this.closeGlobalDatabase();
   }
 
   private async readCentralAccountMetadataManifest(): Promise<CentralAccountMetadataManifestV1 | null> {
-    const manifestPath = this.getCentralAccountMetadataManifestPath();
-    if (!(await fs.pathExists(manifestPath))) {
-      return null;
-    }
-
     try {
-      const raw = (await fs.readJson(
-        manifestPath
-      )) as Partial<CentralAccountMetadataManifestV1>;
-      if (!raw || raw.schemaVersion !== 1 || raw.kind !== 'account-metadata') {
+      const db = await this.getGlobalDatabase();
+      const accounts = db.getAllAccountAssets();
+      if (Object.keys(accounts).length === 0) {
         return null;
       }
       return {
         schemaVersion: 1,
         kind: 'account-metadata',
-        updatedAt: raw.updatedAt || new Date().toISOString(),
-        accounts: raw.accounts ?? {},
+        updatedAt: new Date().toISOString(),
+        accounts,
       };
     } catch {
       return null;
@@ -3435,23 +3492,24 @@ export class RecNetService extends EventEmitter {
   }
 
   private async readCentralAccountRecords(): Promise<CentralAccountRecordsV1 | null> {
-    const recordsPath = this.getCentralAccountRecordsPath();
-    if (!(await fs.pathExists(recordsPath))) {
-      return null;
-    }
-
     try {
-      const raw = (await fs.readJson(
-        recordsPath
-      )) as Partial<CentralAccountRecordsV1>;
-      if (!raw || raw.schemaVersion !== 1 || raw.kind !== 'account-records') {
+      const db = await this.getGlobalDatabase();
+      const all = db.getAllAccounts();
+      if (all.length === 0) {
         return null;
+      }
+      const accounts: Record<string, PlayerResult> = {};
+      for (const account of all) {
+        const accountId = this.normalizeId(account.accountId);
+        if (accountId) {
+          accounts[accountId] = account;
+        }
       }
       return {
         schemaVersion: 1,
         kind: 'account-records',
-        updatedAt: raw.updatedAt || new Date().toISOString(),
-        accounts: raw.accounts ?? {},
+        updatedAt: new Date().toISOString(),
+        accounts,
       };
     } catch {
       return null;
@@ -3461,28 +3519,24 @@ export class RecNetService extends EventEmitter {
   private async writeCentralAccountRecords(
     accounts: PlayerResult[]
   ): Promise<CentralAccountRecordsV1> {
-    const existing = await this.readCentralAccountRecords();
-    const nextAccounts: Record<string, PlayerResult> = {
-      ...(existing?.accounts ?? {}),
-    };
+    const normalized = this.normalizeAccounts(accounts).filter(
+      account => !!account.accountId
+    );
 
-    for (const account of this.normalizeAccounts(accounts)) {
-      if (account.accountId) {
-        nextAccounts[account.accountId] = account;
-      }
+    const db = await this.getGlobalDatabase();
+    db.upsertAccounts(normalized);
+
+    const nextAccounts: Record<string, PlayerResult> = {};
+    for (const account of normalized) {
+      nextAccounts[account.accountId] = account;
     }
 
-    const records: CentralAccountRecordsV1 = {
+    return {
       schemaVersion: 1,
       kind: 'account-records',
       updatedAt: new Date().toISOString(),
       accounts: nextAccounts,
     };
-    await this.writeMetadataManifest(
-      this.getCentralAccountRecordsPath(),
-      records
-    );
-    return records;
   }
 
   private async syncCentralAccountMetadataAssets(
@@ -3495,13 +3549,13 @@ export class RecNetService extends EventEmitter {
     downloadSemaphore?: Semaphore
   ): Promise<CentralAccountMetadataManifestV1> {
     throwIfMetadataSyncAborted(signal);
+    // Downloaded profile/banner image FILES still live on disk; only the
+    // record + asset-manifest mapping moved into the global SQLite store.
     const metadataDirPath = this.getRootMetadataDirectory();
     await fs.ensureDir(metadataDirPath);
 
-    const existing = await this.readCentralAccountMetadataManifest();
-    const nextAccounts: CentralAccountMetadataManifestV1['accounts'] = {
-      ...(existing?.accounts ?? {}),
-    };
+    const db = await this.getGlobalDatabase();
+
     const uniqueAccounts = new Map<string, PlayerResult>();
     for (const account of this.normalizeAccounts(accounts)) {
       if (account.accountId) {
@@ -3521,20 +3575,16 @@ export class RecNetService extends EventEmitter {
       downloadSemaphore
     );
     for (const [accountId, assets] of Object.entries(synced)) {
-      nextAccounts[accountId] = assets;
+      db.setAccountAssets(accountId, assets as AccountAssets);
     }
 
-    const manifest: CentralAccountMetadataManifestV1 = {
+    const nextAccounts = db.getAllAccountAssets();
+    return {
       schemaVersion: 1,
       kind: 'account-metadata',
       updatedAt: new Date().toISOString(),
       accounts: nextAccounts,
     };
-    await this.writeMetadataManifest(
-      this.getCentralAccountMetadataManifestPath(),
-      manifest
-    );
-    return manifest;
   }
 
   private async resolveCentralAccountAssetPaths(
@@ -5199,10 +5249,23 @@ export class RecNetService extends EventEmitter {
     imageCommentsFetched: number;
     imageComments: ImageCommentDto[];
   }> {
+    const db = await this.getGlobalDatabase();
+    const currentPhotoIds = Array.from(
+      new Set(params.normalizedPhotos.map(photo => photo.Id).filter(Boolean))
+    );
+
     if (
       params.imageIdsWithComments.length === 0 &&
       !params.imageCommentsFileExists
     ) {
+      // Nothing expected and no prior export to reconcile — but a current photo
+      // may still hold stale comments in the store; clear those if present.
+      const staleImageIds = currentPhotoIds.filter(
+        imageId => !params.imageCommentCounts.has(imageId)
+      );
+      if (staleImageIds.length > 0) {
+        db.deleteImageCommentsForImageIds(staleImageIds);
+      }
       return { imageCommentsFetched: 0, imageComments: [] };
     }
 
@@ -5218,105 +5281,58 @@ export class RecNetService extends EventEmitter {
       }
     );
 
-    let cachedImageComments: ImageCommentDto[] = [];
     let imageCommentsFetched = 0;
-    const cachedCommentCountsByImageId = new Map<string, number>();
-    const currentPhotoIds = new Set(
-      params.normalizedPhotos.map(photo => photo.Id).filter(Boolean)
-    );
 
-    if (params.imageCommentsFileExists) {
-      try {
-        const existing = (await fs.readJson(
-          params.imageCommentsJsonPath
-        )) as ImageCommentDto[];
-        if (Array.isArray(existing)) {
-          cachedImageComments = this.normalizeImageComments(existing);
-          for (const comment of cachedImageComments) {
-            const imageId = comment.SavedImageId;
-            if (!imageId) {
-              continue;
-            }
-            cachedCommentCountsByImageId.set(
-              imageId,
-              (cachedCommentCountsByImageId.get(imageId) ?? 0) + 1
-            );
-          }
-          await fs.writeJson(
-            params.imageCommentsJsonPath,
-            cachedImageComments,
-            {
-              spaces: 2,
-            }
-          );
-        }
-      } catch (error) {
-        console.log(
-          `Warning: Failed to normalize cached image comment data: ${(error as Error).message}`
-        );
-      }
+    // Stale removal: any current photo that now has no expected comments but
+    // still has rows in the store should be cleared.
+    const storedCountsForPhotos =
+      db.getImageCommentCountsByImageId(currentPhotoIds);
+    const staleImageIds = Array.from(storedCountsForPhotos.keys()).filter(
+      imageId => !params.imageCommentCounts.has(imageId)
+    );
+    if (staleImageIds.length > 0) {
+      db.deleteImageCommentsForImageIds(staleImageIds);
     }
 
+    // Determine which images need a (re)fetch by comparing stored vs expected
+    // comment counts.
+    const storedCounts = db.getImageCommentCountsByImageId(
+      params.imageIdsWithComments
+    );
     const missingOrChangedImageIds = params.forceRefresh
       ? params.imageIdsWithComments
       : params.imageIdsWithComments.filter(imageId => {
-          const cachedCount = cachedCommentCountsByImageId.get(imageId) ?? 0;
+          const storedCount = storedCounts.get(imageId) ?? 0;
           const expectedCount = params.imageCommentCounts.get(imageId) ?? 0;
-          return cachedCount !== expectedCount;
+          return storedCount !== expectedCount;
         });
-    const retainedCachedImageComments = cachedImageComments.filter(comment => {
-      const imageId = comment.SavedImageId;
-      if (!imageId) {
-        return false;
-      }
-      if (
-        currentPhotoIds.has(imageId) &&
-        !params.imageCommentCounts.has(imageId)
-      ) {
-        return false;
-      }
-      return true;
-    });
 
     if (missingOrChangedImageIds.length === 0) {
-      if (retainedCachedImageComments.length !== cachedImageComments.length) {
-        await fs.writeJson(
-          params.imageCommentsJsonPath,
-          retainedCachedImageComments,
-          {
-            spaces: 2,
-          }
-        );
-        this.updateSourceProgress(
-          'metadata',
-          params.source,
-          'Image comment data updated',
-          params.imageIdsWithComments.length,
-          params.imageIdsWithComments.length,
-          100,
-          {
-            pageLabel: 'Image comments',
-            recentActivity: 'Removed stale image comment cache entries.',
-          }
-        );
-      } else {
-        this.updateSourceProgress(
-          'metadata',
-          params.source,
-          'Using cached image comment data',
-          params.imageIdsWithComments.length,
-          params.imageIdsWithComments.length,
-          100,
-          {
-            pageLabel: 'Image comments',
-            recentActivity: 'Using cached image comment data.',
-          }
-        );
-      }
+      const folderComments = db.getImageCommentsForImageIds(currentPhotoIds);
+      await fs.writeJson(params.imageCommentsJsonPath, folderComments, {
+        spaces: 2,
+      });
+      this.updateSourceProgress(
+        'metadata',
+        params.source,
+        staleImageIds.length > 0
+          ? 'Image comment data updated'
+          : 'Using cached image comment data',
+        params.imageIdsWithComments.length,
+        params.imageIdsWithComments.length,
+        100,
+        {
+          pageLabel: 'Image comments',
+          recentActivity:
+            staleImageIds.length > 0
+              ? 'Removed stale image comment entries.'
+              : 'Using cached image comment data.',
+        }
+      );
 
       return {
         imageCommentsFetched: 0,
-        imageComments: retainedCachedImageComments,
+        imageComments: folderComments,
       };
     }
 
@@ -5367,22 +5383,13 @@ export class RecNetService extends EventEmitter {
       );
     }
 
-    const refreshedImageIds = new Set(missingOrChangedImageIds);
-    const mergedImageCommentsMap = new Map<string, ImageCommentDto>();
+    // Replace stored comments for every refreshed image: clear the prior rows,
+    // then insert the freshly downloaded set (an image with zero comments ends
+    // up with no rows).
+    db.deleteImageCommentsForImageIds(missingOrChangedImageIds);
+    db.upsertImageComments(refreshedComments);
 
-    for (const comment of retainedCachedImageComments) {
-      const imageId = comment.SavedImageId;
-      if (!imageId || refreshedImageIds.has(imageId)) {
-        continue;
-      }
-      mergedImageCommentsMap.set(comment.SavedImageCommentId, comment);
-    }
-
-    for (const comment of refreshedComments) {
-      mergedImageCommentsMap.set(comment.SavedImageCommentId, comment);
-    }
-
-    const mergedImageComments = Array.from(mergedImageCommentsMap.values());
+    const mergedImageComments = db.getImageCommentsForImageIds(currentPhotoIds);
     await fs.writeJson(params.imageCommentsJsonPath, mergedImageComments, {
       spaces: 2,
     });
@@ -5957,9 +5964,6 @@ export class RecNetService extends EventEmitter {
         accountDir,
         `${fileStem}_image_comments.json`
       );
-      const accountsFileExists = await fs.pathExists(accountsJsonPath);
-      const roomsFileExists = await fs.pathExists(roomsJsonPath);
-      const eventsFileExists = await fs.pathExists(eventsJsonPath);
       const imageCommentsFileExists = await fs.pathExists(
         imageCommentsJsonPath
       );
@@ -6019,46 +6023,13 @@ export class RecNetService extends EventEmitter {
           }
         );
 
-        let cachedAccounts: PlayerResult[] = [];
-        let cachedAccountIds = new Set<string>();
+        // SQLite (data.sqlite) is the working cache + source of truth. Dedup
+        // against records already stored instead of a per-folder JSON cache.
+        const db = await this.getGlobalDatabase();
 
-        if (accountsFileExists) {
-          try {
-            const existing = (await fs.readJson(
-              accountsJsonPath
-            )) as PlayerResult[];
-            if (Array.isArray(existing)) {
-              cachedAccounts = this.normalizeAccounts(existing);
-              cachedAccountIds = new Set(
-                cachedAccounts
-                  .map(account => account.accountId)
-                  .filter((id): id is string => !!id)
-              );
-              // Normalize and persist cached data to keep IDs consistent
-              await fs.writeJson(accountsJsonPath, cachedAccounts, {
-                spaces: 2,
-              });
-
-              const owner = this.computeOwnerFromAccounts(
-                cachedAccounts,
-                accountId
-              );
-              if (owner && shouldWriteOwnerMeta) {
-                await this.writeFolderMeta(accountDir, accountId, { owner });
-              }
-              await this.writeCentralAccountRecords(cachedAccounts);
-            }
-          } catch (error) {
-            console.log(
-              `Warning: Failed to normalize cached account data: ${(error as Error).message}`
-            );
-          }
-        }
-
-        const missingAccountIds =
-          accountsFileExists && !forceAccountsRefresh
-            ? accountIdsArray.filter(id => !cachedAccountIds.has(String(id)))
-            : accountIdsArray;
+        const missingAccountIds = forceAccountsRefresh
+          ? accountIdsArray
+          : db.getMissingAccountIds(accountIdsArray);
 
         if (missingAccountIds.length === 0) {
           this.updateSourceProgress(
@@ -6105,31 +6076,8 @@ export class RecNetService extends EventEmitter {
             : [];
           accountsFetched = normalizedAccounts.length;
 
-          // Merge new data with cached data (prefer freshly downloaded entries)
-          const mergedAccountsMap = new Map<string, PlayerResult>();
-          for (const account of cachedAccounts) {
-            mergedAccountsMap.set(account.accountId, account);
-          }
-          for (const account of normalizedAccounts) {
-            mergedAccountsMap.set(account.accountId, account);
-          }
-
-          const mergedAccounts = Array.from(mergedAccountsMap.values());
-          await fs.writeJson(accountsJsonPath, mergedAccounts, {
-            spaces: 2,
-          });
-          await this.writeCentralAccountRecords(mergedAccounts);
-
-          const owner = this.computeOwnerFromAccounts(
-            mergedAccounts,
-            accountId
-          );
-          if (owner && shouldWriteOwnerMeta) {
-            await this.writeFolderMeta(accountDir, accountId, { owner });
-          }
-          console.log(
-            `Saved ${mergedAccounts.length} accounts to ${accountsJsonPath} (downloaded ${normalizedAccounts.length} new entries)`
-          );
+          // SQLite is the source of truth: persist freshly fetched records.
+          db.upsertAccounts(normalizedAccounts);
 
           this.updateSourceProgress(
             'metadata',
@@ -6143,6 +6091,19 @@ export class RecNetService extends EventEmitter {
             }
           );
         }
+
+        // Emit the per-folder accounts export from the working DB (source of
+        // truth) — the accounts relevant to this folder's photos/comments.
+        const folderAccounts = db.getAccounts(accountIdsArray);
+        await fs.writeJson(accountsJsonPath, folderAccounts, { spaces: 2 });
+
+        const owner = this.computeOwnerFromAccounts(folderAccounts, accountId);
+        if (owner && shouldWriteOwnerMeta) {
+          await this.writeFolderMeta(accountDir, accountId, { owner });
+        }
+        console.log(
+          `Saved ${folderAccounts.length} accounts to ${accountsJsonPath}`
+        );
       }
 
       // Fetch and save room data
@@ -6159,28 +6120,12 @@ export class RecNetService extends EventEmitter {
           }
         );
 
-        let cachedRooms: RoomDto[] = [];
-        let cachedRoomIds = new Set<string>();
+        // SQLite is the working cache/source of truth for rooms too.
+        const db = await this.getGlobalDatabase();
 
-        if (roomsFileExists) {
-          try {
-            const existing = (await fs.readJson(roomsJsonPath)) as RoomDto[];
-            if (Array.isArray(existing)) {
-              cachedRooms = this.normalizeRooms(existing);
-              cachedRoomIds = new Set(cachedRooms.map(room => room.RoomId));
-              await fs.writeJson(roomsJsonPath, cachedRooms, { spaces: 2 });
-            }
-          } catch (error) {
-            console.log(
-              `Warning: Failed to normalize cached room data: ${(error as Error).message}`
-            );
-          }
-        }
-
-        const missingRoomIds =
-          roomsFileExists && !forceRoomsRefresh
-            ? roomIdsArray.filter(id => !cachedRoomIds.has(String(id)))
-            : roomIdsArray;
+        const missingRoomIds = forceRoomsRefresh
+          ? roomIdsArray
+          : db.getMissingRoomIds(roomIdsArray);
 
         if (missingRoomIds.length === 0) {
           this.updateSourceProgress(
@@ -6226,19 +6171,7 @@ export class RecNetService extends EventEmitter {
             : [];
           roomsFetched = normalizedRooms.length;
 
-          const mergedRoomsMap = new Map<string, RoomDto>();
-          for (const room of cachedRooms) {
-            mergedRoomsMap.set(room.RoomId, room);
-          }
-          for (const room of normalizedRooms) {
-            mergedRoomsMap.set(room.RoomId, room);
-          }
-
-          const mergedRooms = Array.from(mergedRoomsMap.values());
-          await fs.writeJson(roomsJsonPath, mergedRooms, { spaces: 2 });
-          console.log(
-            `Saved ${mergedRooms.length} rooms to ${roomsJsonPath} (downloaded ${normalizedRooms.length} new entries)`
-          );
+          db.upsertRooms(normalizedRooms);
 
           this.updateSourceProgress(
             'metadata',
@@ -6252,6 +6185,11 @@ export class RecNetService extends EventEmitter {
             }
           );
         }
+
+        // Emit the per-folder rooms export from the working DB.
+        const folderRooms = db.getRooms(roomIdsArray);
+        await fs.writeJson(roomsJsonPath, folderRooms, { spaces: 2 });
+        console.log(`Saved ${folderRooms.length} rooms to ${roomsJsonPath}`);
       }
 
       // Fetch and save event data
@@ -6268,32 +6206,12 @@ export class RecNetService extends EventEmitter {
           }
         );
 
-        let cachedEvents: EventDto[] = [];
-        let cachedEventIds = new Set<string>();
+        // SQLite is the working cache/source of truth for events too.
+        const db = await this.getGlobalDatabase();
 
-        if (eventsFileExists) {
-          try {
-            const existing = (await fs.readJson(eventsJsonPath)) as EventDto[];
-            if (Array.isArray(existing)) {
-              cachedEvents = this.normalizeEvents(existing);
-              cachedEventIds = new Set(
-                cachedEvents
-                  .map(event => event.PlayerEventId)
-                  .filter((id): id is string => !!id)
-              );
-              await fs.writeJson(eventsJsonPath, cachedEvents, { spaces: 2 });
-            }
-          } catch (error) {
-            console.log(
-              `Warning: Failed to normalize cached event data: ${(error as Error).message}`
-            );
-          }
-        }
-
-        const missingEventIds =
-          eventsFileExists && !forceEventsRefresh
-            ? eventIdsArray.filter(id => !cachedEventIds.has(String(id)))
-            : eventIdsArray;
+        const missingEventIds = forceEventsRefresh
+          ? eventIdsArray
+          : db.getMissingEventIds(eventIdsArray);
 
         if (missingEventIds.length === 0) {
           this.updateSourceProgress(
@@ -6339,19 +6257,7 @@ export class RecNetService extends EventEmitter {
             : [];
           eventsFetched = normalizedEvents.length;
 
-          const mergedEventsMap = new Map<string, EventDto>();
-          for (const event of cachedEvents) {
-            mergedEventsMap.set(event.PlayerEventId, event);
-          }
-          for (const event of normalizedEvents) {
-            mergedEventsMap.set(event.PlayerEventId, event);
-          }
-
-          const mergedEvents = Array.from(mergedEventsMap.values());
-          await fs.writeJson(eventsJsonPath, mergedEvents, { spaces: 2 });
-          console.log(
-            `Saved ${mergedEvents.length} events to ${eventsJsonPath} (downloaded ${normalizedEvents.length} new entries)`
-          );
+          db.upsertEvents(normalizedEvents);
 
           this.updateSourceProgress(
             'metadata',
@@ -6365,6 +6271,11 @@ export class RecNetService extends EventEmitter {
             }
           );
         }
+
+        // Emit the per-folder events export from the working DB.
+        const folderEvents = db.getEvents(eventIdsArray);
+        await fs.writeJson(eventsJsonPath, folderEvents, { spaces: 2 });
+        console.log(`Saved ${folderEvents.length} events to ${eventsJsonPath}`);
       }
 
       return {
@@ -7915,19 +7826,17 @@ export class RecNetService extends EventEmitter {
         const upsertResult = db.upsertPhotos(uniqueBatch);
         const newPhotosAdded = upsertResult.inserted;
 
-        // Fetch related accounts/rooms/events for ONLY the new batch's photos and
-        // UPSERT them into the database. Comments are deferred to the manual pass.
-        const relatedMetadata = await this.syncRoomBatchRelatedData(
-          db,
-          uniqueBatch,
-          params.token,
-          {
-            forceAccountsRefresh: params.forceAccountsRefresh,
-            forceRoomsRefresh: params.forceRoomsRefresh,
-            forceEventsRefresh: params.forceEventsRefresh,
-            forceImageCommentsRefresh: params.forceImageCommentsRefresh,
-          }
-        );
+        // PHASE 1 is pure page capture: it only records photo metadata pages
+        // into the room's capture database. Related account/room/event metadata
+        // (Phase 2), account images (Phase 4) and image comments (Phase 5) are
+        // captured in their own dedicated passes after every page is captured,
+        // so there is no interleaving inside the page loop.
+        const relatedMetadata = {
+          accountsFetched: 0,
+          roomsFetched: 0,
+          eventsFetched: 0,
+          imageCommentsFetched: 0,
+        };
 
         const uniqueBatchPhotos = Array.from(
           new Map(
@@ -8094,39 +8003,7 @@ export class RecNetService extends EventEmitter {
             },
           },
         });
-        if (this.settings.backgroundMetadataSyncEnabled) {
-          metadataProgress?.({
-            currentStep: 'Syncing room metadata images',
-            currentItemLabel: roomName,
-            current: 0,
-            total: 1,
-            downloadedAssets: 0,
-            skippedAssets: 0,
-            failedAssets: 0,
-            force: false,
-          });
-          await this.syncRoomFolderMetadataAssets(
-            roomId,
-            false,
-            params.token,
-            createMetadataSyncAssetTracker(metadataProgress, false)
-          );
-          metadataProgress?.({
-            currentStep: 'Synced room metadata images',
-            currentItemLabel: roomName,
-            current: 1,
-            total: 1,
-            force: false,
-          });
-        }
         const totalPhotos = db.countPhotos();
-        if (!hasMoreAfterJump && !params.metadataOnly) {
-          // Room finished capturing — regenerate the JSON export artifacts from
-          // the SQLite database in one pass (replacing per-batch JSON rewrites).
-          // In metadata-only mode the export is deferred to the download pass so
-          // the JSON includes local image paths.
-          await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
-        }
 
         this.logDownloadBatchSummary(trace, downloadStats);
         this.setOperationComplete();
@@ -8371,9 +8248,10 @@ export class RecNetService extends EventEmitter {
           this.logDownloadBatchSummary(trace, downloadStats);
         }
 
-        // Regenerate the JSON export artifacts from the database now that the
-        // downloads (and their local file paths) are committed.
-        await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
+        // PHASE 3 only downloads room images and commits their local paths into
+        // the capture database. The JSON export artifacts are emitted later in
+        // PHASE 5 ({@link captureRoomImageComments}) so the exported JSON also
+        // includes account image paths (Phase 4) and image comments (Phase 5).
 
         const totalPhotos = db.countPhotos();
         this.setOperationComplete();
@@ -8389,6 +8267,390 @@ export class RecNetService extends EventEmitter {
           totalResults: downloadResults.length,
           guidance: this.buildDownloadGuidance('room photos', downloadStats),
         };
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      if (!this.isOperationCancelledError(error)) {
+        this.setOperationFailed((error as Error).message);
+      }
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  /**
+   * Resolve a room target from loose params (`roomName` / `roomId` / `room`)
+   * into a normalized `{ room, roomId, roomName }` triple. Shared by the
+   * per-room phase methods so each one accepts the same identifiers.
+   */
+  private async resolveRoomTarget(
+    params: { roomName?: string; roomId?: string; room?: RoomDto },
+    token?: string
+  ): Promise<{ room: RoomDto; roomId: string; roomName: string }> {
+    const suppliedRoom = params.room
+      ? this.normalizeRooms([params.room])[0]
+      : undefined;
+    const suppliedRoomId = this.normalizeId(
+      params.roomId ?? suppliedRoom?.RoomId
+    );
+    const suppliedRoomName = (
+      params.roomName ??
+      suppliedRoom?.Name ??
+      suppliedRoomId
+    ).trim();
+    if (!suppliedRoomId && !suppliedRoomName) {
+      throw new Error('Room name or room ID is required.');
+    }
+    const room =
+      suppliedRoomId && suppliedRoom
+        ? {
+            ...suppliedRoom,
+            RoomId: suppliedRoomId,
+            Name: suppliedRoom.Name || suppliedRoomName || suppliedRoomId,
+          }
+        : suppliedRoomId
+          ? this.normalizeRooms([
+              {
+                ...(suppliedRoom ?? ({} as RoomDto)),
+                RoomId: suppliedRoomId,
+                Name: suppliedRoomName || suppliedRoomId,
+              } as RoomDto,
+            ])[0]
+          : await this.lookupRoomByName(suppliedRoomName, token);
+    const roomId = this.normalizeId(room.RoomId);
+    const roomName = room.Name || suppliedRoomName || roomId;
+    return { room, roomId, roomName };
+  }
+
+  /**
+   * PHASE 2 — capture ALL related account/room/event metadata for a room in a
+   * single pass. Reads every photo captured in PHASE 1 from the room's SQLite
+   * store and fetches any missing accounts/rooms/events once (no per-page
+   * interleaving). Image comments are deferred to PHASE 5.
+   */
+  async syncRoomRelatedMetadata(params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    forceAccountsRefresh?: boolean;
+    forceRoomsRefresh?: boolean;
+    forceEventsRefresh?: boolean;
+  }): Promise<RoomMetadataSyncResult> {
+    await this.ensureSettingsLoaded();
+    const operation = this.startOperation();
+    try {
+      const { roomId, roomName } = await this.resolveRoomTarget(
+        params,
+        params.token
+      );
+      const roomDir = this.getRoomDirectory(roomId);
+      await fs.ensureDir(roomDir);
+
+      this.resetProgressIssueState();
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        'Capturing account metadata...',
+        0,
+        0,
+        0,
+        {
+          recentActivity: `Collecting related metadata for ${roomName}...`,
+        }
+      );
+
+      const db = await RoomDatabase.open(roomDir);
+      try {
+        const allPhotos = db.getAllPhotos();
+        const related = await this.syncRoomBatchRelatedData(
+          db,
+          allPhotos,
+          params.token,
+          {
+            forceAccountsRefresh: params.forceAccountsRefresh,
+            forceRoomsRefresh: params.forceRoomsRefresh,
+            forceEventsRefresh: params.forceEventsRefresh,
+          }
+        );
+
+        const result: RoomMetadataSyncResult = {
+          roomId,
+          roomName,
+          accountsFetched: related.accountsFetched,
+          roomsFetched: related.roomsFetched,
+          eventsFetched: related.eventsFetched,
+          totalAccounts: db.getAllAccounts().length,
+          totalRooms: db.getAllRooms().length,
+          totalEvents: db.getAllEvents().length,
+        };
+        this.setOperationComplete();
+        return result;
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      if (!this.isOperationCancelledError(error)) {
+        this.setOperationFailed((error as Error).message);
+      }
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  /**
+   * PHASE 4 — download ALL account images (profile/banner) referenced by a
+   * room's captured accounts, plus the room's listing image. Reads the accounts
+   * and room record straight from the room's SQLite store (so it does not
+   * depend on the JSON export, which is emitted later in PHASE 5).
+   */
+  async syncRoomAccountImages(params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    force?: boolean;
+  }): Promise<RoomAssetSyncResult> {
+    await this.ensureSettingsLoaded();
+    const operation = this.startOperation();
+    const force = Boolean(params.force);
+    try {
+      const {
+        room: resolvedRoom,
+        roomId,
+        roomName,
+      } = await this.resolveRoomTarget(params, params.token);
+      const roomDir = this.getRoomDirectory(roomId);
+      await fs.ensureDir(roomDir);
+
+      this.resetProgressIssueState();
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        'Downloading account images...',
+        0,
+        0,
+        0,
+        {
+          pageLabel: 'Account images',
+          recentActivity: `Downloading account images for ${roomName}...`,
+        }
+      );
+
+      const db = await RoomDatabase.open(roomDir);
+      try {
+        const signal = operation.controller.signal;
+        const tracker = createMetadataSyncAssetTracker(progress => {
+          const total = progress.totalAssets ?? 0;
+          const checked = progress.checkedAssets ?? 0;
+          this.updateSourceProgress(
+            'metadata',
+            'room-photos',
+            progress.currentStep ?? 'Downloading account images...',
+            checked,
+            total,
+            total > 0 ? Math.round((checked / total) * 100) : 0,
+            {
+              pageLabel: 'Account images',
+              activeItemLabel: progress.currentAssetLabel,
+              recentActivity: progress.currentAssetLabel,
+            }
+          );
+        }, force);
+        const semaphore = new Semaphore(this.settings.maxConcurrentDownloads);
+        const metadataDirPath = path.join(roomDir, METADATA_SUBDIR);
+        await fs.ensureDir(metadataDirPath);
+
+        // Room listing image (prefer the stored room record, fall back to the
+        // supplied room).
+        const dbRooms = db.getAllRooms();
+        const room =
+          dbRooms.find(r => this.normalizeId(r.RoomId) === roomId) ??
+          resolvedRoom;
+        let roomImageEntry: MetadataImageEntryV1 | undefined;
+        const roomImageName = this.normalizeImageName(room?.ImageName);
+        if (roomImageName) {
+          const roomImageResult = await this.downloadMetadataAssetToDir(
+            roomImageName,
+            metadataDirPath,
+            force,
+            params.token,
+            tracker,
+            `${room?.Name || roomId} room image`,
+            signal,
+            semaphore
+          );
+          roomImageEntry = roomImageResult.entry;
+        }
+
+        // Account profile images (central store).
+        const accounts = db.getAllAccounts();
+        await this.syncCentralAccountMetadataAssets(
+          accounts,
+          force,
+          params.token,
+          tracker,
+          signal,
+          false,
+          semaphore
+        );
+
+        // Room listing manifest + folder meta.
+        const manifest: RoomListingMetadataManifestV1 = {
+          schemaVersion: 1,
+          kind: 'room-listing',
+          roomId,
+          updatedAt: new Date().toISOString(),
+          roomImage: roomImageEntry,
+        };
+        await this.writeMetadataManifest(
+          path.join(metadataDirPath, METADATA_MANIFEST_FILE),
+          manifest
+        );
+        if (roomImageEntry && room) {
+          await this.writeRoomFolderMeta(roomDir, room, {
+            localRoomImagePath: roomImageEntry.absolutePath,
+          });
+        }
+
+        const result: RoomAssetSyncResult = {
+          roomId,
+          roomName,
+          downloadedAssets: tracker?.downloadedAssets ?? 0,
+          skippedAssets: tracker?.skippedAssets ?? 0,
+          failedAssets: tracker?.failedAssets ?? 0,
+        };
+        this.setOperationComplete();
+        return result;
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      if (!this.isOperationCancelledError(error)) {
+        this.setOperationFailed((error as Error).message);
+      }
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  /**
+   * PHASE 5 — capture ALL image comments for a room's photos, then emit the
+   * room's final JSON export artifacts from the capture database. This runs
+   * last so the exported JSON includes the local image paths (PHASE 3) and
+   * account image paths (PHASE 4) alongside the freshly captured comments.
+   */
+  async captureRoomImageComments(params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    forceImageCommentsRefresh?: boolean;
+  }): Promise<RoomImageCommentsResult> {
+    await this.ensureSettingsLoaded();
+    const operation = this.startOperation();
+    try {
+      const { roomId, roomName } = await this.resolveRoomTarget(
+        params,
+        params.token
+      );
+      const roomDir = this.getRoomDirectory(roomId);
+      await fs.ensureDir(roomDir);
+
+      this.resetProgressIssueState();
+      const requestOptions = { signal: operation.controller.signal };
+
+      const db = await RoomDatabase.open(roomDir);
+      try {
+        // When forcing a refresh, re-fetch every image that has comments;
+        // otherwise only fetch images whose comments were never captured.
+        const imageIdsNeedingComments = params.forceImageCommentsRefresh
+          ? db
+              .getAllPhotos()
+              .filter(photo => (photo.CommentCount ?? 0) > 0)
+              .map(photo => this.normalizeId(photo.Id))
+              .filter((id): id is string => !!id)
+          : db.getImageIdsNeedingComments();
+
+        const totalImages = imageIdsNeedingComments.length;
+        let commentsFetched = 0;
+
+        this.updateSourceProgress(
+          'metadata',
+          'room-photos',
+          totalImages > 0
+            ? `Downloading image comments (${totalImages} image(s))...`
+            : 'Image comments up to date',
+          0,
+          totalImages,
+          totalImages > 0 ? 0 : 100,
+          {
+            pageLabel: 'Image comments',
+            recentActivity: `Capturing image comments for ${roomName}...`,
+          }
+        );
+
+        for (let index = 0; index < imageIdsNeedingComments.length; index++) {
+          if (operation.cancelled) {
+            throw this.createOperationCancelledError();
+          }
+          const imageId = imageIdsNeedingComments[index];
+          const commentsData = await this.runMetadataRequestWithRetry({
+            label: `image comment metadata for image ${imageId}`,
+            source: 'room-photos',
+            operationRef: operation,
+            pageLabel: 'Image comments',
+            recentActivity: `Downloaded comments for image ${index + 1}/${totalImages}.`,
+            operation: () =>
+              this.rateLimitedFetchImageComments(
+                imageId,
+                params.token,
+                requestOptions
+              ),
+          });
+          const normalizedComments = Array.isArray(commentsData)
+            ? this.normalizeImageComments(commentsData)
+            : [];
+          if (params.forceImageCommentsRefresh) {
+            db.deleteImageCommentsForImageIds([imageId]);
+          }
+          if (normalizedComments.length > 0) {
+            db.upsertImageComments(normalizedComments);
+          }
+          db.markCommentsFetched(imageId, normalizedComments.length);
+          commentsFetched += normalizedComments.length;
+
+          this.updateSourceProgress(
+            'metadata',
+            'room-photos',
+            `Downloaded image comments for ${index + 1}/${totalImages} image(s)`,
+            index + 1,
+            totalImages,
+            Math.round(((index + 1) / totalImages) * 100),
+            {
+              pageLabel: 'Image comments',
+            }
+          );
+        }
+
+        // FINAL export — emit the room's JSON artifacts from the capture
+        // database now that every phase (pages, metadata, room images, account
+        // images, comments) is complete.
+        await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
+
+        const result: RoomImageCommentsResult = {
+          roomId,
+          roomName,
+          imagesProcessed: totalImages,
+          commentsFetched,
+          totalComments: db.getAllImageComments().length,
+        };
+        this.setOperationComplete();
+        return result;
       } finally {
         db.close();
       }

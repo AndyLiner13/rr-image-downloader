@@ -29,7 +29,10 @@ import type {
     ProfileHistoryCollectionResult,
     Progress,
     RecNetSettings,
+    RoomAssetSyncResult,
     RoomDto,
+    RoomImageCommentsResult,
+    RoomMetadataSyncResult,
     RoomPhotoBatchResult,
     RoomPhotoDownloadResult,
     RoomPhotoSort,
@@ -108,6 +111,29 @@ export interface ElectronAPI {
     room?: RoomDto;
     token?: string;
   }) => Promise<ApiResponse<RoomPhotoDownloadResult>>;
+  syncRoomRelatedMetadata: (params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    forceAccountsRefresh?: boolean;
+    forceRoomsRefresh?: boolean;
+    forceEventsRefresh?: boolean;
+  }) => Promise<ApiResponse<RoomMetadataSyncResult>>;
+  syncRoomAccountImages: (params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    force?: boolean;
+  }) => Promise<ApiResponse<RoomAssetSyncResult>>;
+  captureRoomImageComments: (params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+    forceImageCommentsRefresh?: boolean;
+  }) => Promise<ApiResponse<RoomImageCommentsResult>>;
   loadMyRoomsManifest: (params?: {
     sourcePath?: string;
   }) => Promise<ApiResponse<MyRoomsManifestResult>>;
