@@ -1,12 +1,13 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { RecNetService } from '../recnet-service';
-import { PhotosController } from '../recnet/photos-controller';
-import { RoomsController } from '../recnet/rooms-controller';
-import { EventsController } from '../recnet/events-controller';
-import { ImageDto } from '../../models/ImageDto';
 import { EventDto } from '../../models/EventDto';
 import { GenericResponse } from '../../models/GenericResponse';
+import { ImageDto } from '../../models/ImageDto';
+import { RecNetService } from '../recnet-service';
+import { EventsController } from '../recnet/events-controller';
+import { PhotosController } from '../recnet/photos-controller';
+import { RoomsController } from '../recnet/rooms-controller';
+import { RoomDatabase } from '../storage/room-database';
 
 jest.mock('fs-extra', () => {
   const actualFs = jest.requireActual('fs-extra');
@@ -36,6 +37,7 @@ describe('RecNetService - Room Photo Batches', () => {
   let mockRoomsController: jest.Mocked<RoomsController>;
   let mockEventsController: jest.Mocked<EventsController>;
   const outputRoot = path.join(__dirname, 'test-output', 'rooms');
+  const actualFs = jest.requireActual('fs-extra');
 
   const createRoom = () =>
     ({
@@ -83,8 +85,17 @@ describe('RecNetService - Room Photo Batches', () => {
     RecurrenceSchedule: null,
   });
 
+  afterAll(async () => {
+    // Remove the real SQLite capture databases the tests create on disk.
+    await actualFs.remove(path.join(__dirname, 'test-output'));
+  });
+
   beforeEach(async () => {
     jest.clearAllMocks();
+    // The capture path now opens a real node:sqlite database on disk, so the
+    // mocked filesystem must actually create directories. Start from a clean
+    // output tree each test for isolation (the DB file persists otherwise).
+    await actualFs.remove(outputRoot);
     service = new RecNetService();
     await service.updateSettings({
       outputRoot,
@@ -120,7 +131,9 @@ describe('RecNetService - Room Photo Batches', () => {
     (service as any).eventsController = mockEventsController;
 
     (mockedFs.pathExists as jest.Mock).mockResolvedValue(false);
-    (mockedFs.ensureDir as jest.Mock).mockResolvedValue(undefined);
+    (mockedFs.ensureDir as jest.Mock).mockImplementation((dir: string) =>
+      actualFs.ensureDir(dir)
+    );
     (mockedFs.writeJson as jest.Mock).mockResolvedValue(undefined);
     (mockedFs.writeFile as jest.Mock).mockResolvedValue(undefined);
     mockRoomsController.lookupRoomByName.mockResolvedValue(createRoom());
@@ -157,11 +170,21 @@ describe('RecNetService - Room Photo Batches', () => {
       undefined,
       expect.any(Object)
     );
-    expect(mockedFs.writeJson).toHaveBeenCalledWith(
+    // New SQLite-backed architecture: photos are NOT rewritten to
+    // `${roomId}_photos.json` on every batch (the old O(N^2) behavior). They
+    // accumulate in the capture database and are exported once the room
+    // finishes. This run still has more pages, so no JSON export happened.
+    expect(mockedFs.writeJson).not.toHaveBeenCalledWith(
       path.join(roomDir, '2754290_photos.json'),
-      expect.any(Array),
-      { spaces: 2 }
+      expect.anything(),
+      expect.anything()
     );
+    const db = await RoomDatabase.open(roomDir);
+    try {
+      expect(db.countPhotos()).toBe(10);
+    } finally {
+      db.close();
+    }
     expect(mockedFs.writeJson).toHaveBeenCalledWith(
       path.join(roomDir, 'folder-meta.json'),
       expect.objectContaining({
@@ -404,7 +427,12 @@ describe('RecNetService - Room Photo Batches', () => {
     const event = createEvent();
     const eventDir = path.join(outputRoot, 'events', 'creator-1', 'event-1');
     const photosDir = path.join(eventDir, 'photos');
-    const manifestPath = path.join(outputRoot, 'events', 'creator-1', 'events.json');
+    const manifestPath = path.join(
+      outputRoot,
+      'events',
+      'creator-1',
+      'events.json'
+    );
 
     (mockedFs.pathExists as jest.Mock).mockImplementation(async filePath => {
       return filePath === manifestPath || filePath === photosDir;
@@ -450,21 +478,28 @@ describe('RecNetService - Room Photo Batches', () => {
     );
 
     expect(service.fetchAndSaveBulkData).toHaveBeenCalled();
-    const bulkCall = (service.fetchAndSaveBulkData as jest.Mock).mock.calls.find(
-      (call: unknown[]) => call[0] === 'creator-1'
-    );
+    const bulkCall = (
+      service.fetchAndSaveBulkData as jest.Mock
+    ).mock.calls.find((call: unknown[]) => call[0] === 'creator-1');
     expect(bulkCall).toBeDefined();
     expect(bulkCall![0]).toBe('creator-1');
     const photosForBulk = bulkCall![1] as { Id: string }[];
     expect(photosForBulk.some(p => p.Id === 'photo-1')).toBe(true);
-    expect(photosForBulk.some(p => p.Id === 'stm-event-bulk-context')).toBe(true);
+    expect(photosForBulk.some(p => p.Id === 'stm-event-bulk-context')).toBe(
+      true
+    );
   });
 
   it('marks empty event albums as downloaded when the API returns no photos', async () => {
     const event = createEvent();
     const eventDir = path.join(outputRoot, 'events', 'creator-1', 'event-1');
     const photosDir = path.join(eventDir, 'photos');
-    const manifestPath = path.join(outputRoot, 'events', 'creator-1', 'events.json');
+    const manifestPath = path.join(
+      outputRoot,
+      'events',
+      'creator-1',
+      'events.json'
+    );
 
     (mockedFs.pathExists as jest.Mock).mockImplementation(async filePath => {
       return filePath === manifestPath || filePath === photosDir;

@@ -1,59 +1,60 @@
-import * as fs from 'fs-extra';
-import * as path from 'path';
 import { EventEmitter } from 'events';
+import * as fs from 'fs-extra';
 import * as os from 'os';
-import {
-  RecNetSettings,
-  Progress,
-  CollectionResult,
-  DownloadPreflightSourceSummary,
-  DownloadPreflightSummary,
-  DownloadResult,
-  ProfileHistoryAccessResult,
-  ProfileHistoryCollectionResult,
-  Photo,
-  IterationDetail,
-  DownloadResultItem,
-  DownloadStats,
-  AccountInfo,
-  BulkDataRefreshOptions,
-  AvailableEvent,
-  AvailableEventCreator,
-  AvailableRoom,
-  EventDiscoveryResult,
-  EventPhotoBatchResult,
-  RoomPhotoBatchResult,
-  RoomPhotoSort,
-  LibraryMoveProgress,
-  LibraryMoveResult,
-  MetadataSyncResult,
-  MetadataSyncState,
-} from '../../shared/types';
+import * as path from 'path';
 import { buildCdnImageUrl, DEFAULT_CDN_BASE } from '../../shared/cdnUrl';
 import {
-  DownloadSource,
-  DownloadSourceSelection,
-  getSelectedDownloadSources,
+    DownloadSource,
+    DownloadSourceSelection,
+    getSelectedDownloadSources,
 } from '../../shared/download-sources';
+import {
+    AccountInfo,
+    AvailableEvent,
+    AvailableEventCreator,
+    AvailableRoom,
+    BulkDataRefreshOptions,
+    CollectionResult,
+    DownloadPreflightSourceSummary,
+    DownloadPreflightSummary,
+    DownloadResult,
+    DownloadResultItem,
+    DownloadStats,
+    EventDiscoveryResult,
+    EventPhotoBatchResult,
+    IterationDetail,
+    LibraryMoveProgress,
+    LibraryMoveResult,
+    MetadataSyncResult,
+    MetadataSyncState,
+    Photo,
+    ProfileHistoryAccessResult,
+    ProfileHistoryCollectionResult,
+    Progress,
+    RecNetSettings,
+    RoomPhotoBatchResult,
+    RoomPhotoSort,
+} from '../../shared/types';
 import { EventDto } from '../models/EventDto';
 import { ImageCommentDto } from '../models/ImageCommentDto';
 import { ImageDto } from '../models/ImageDto';
 import { PlayerResult } from '../models/PlayerDto';
 import { ProfileHistoryImageDto } from '../models/ProfileHistoryImageDto';
 import { RoomDto } from '../models/RoomDto';
+import { Semaphore } from '../utils/semaphore';
+import {
+    LibraryMoveCancelledError,
+    pathsEffectivelyEqual,
+    removePartialLibraryCopy,
+    runLibraryMove,
+} from './library-move';
 import { AccountsController } from './recnet/accounts-controller';
 import { EventsController } from './recnet/events-controller';
 import { RecNetHttpClient } from './recnet/http-client';
 import { ImageCommentsController } from './recnet/image-comments-controller';
 import { PhotosController } from './recnet/photos-controller';
 import { RoomsController } from './recnet/rooms-controller';
-import { Semaphore } from '../utils/semaphore';
-import {
-  LibraryMoveCancelledError,
-  pathsEffectivelyEqual,
-  removePartialLibraryCopy,
-  runLibraryMove,
-} from './library-move';
+import { RoomDatabase } from './storage/room-database';
 
 type MetadataSyncProgress = Omit<MetadataSyncState, 'phase'>;
 type MetadataSyncProgressReporter = (
@@ -1279,7 +1280,7 @@ export class RecNetService extends EventEmitter {
           }
         );
 
-        let url = `https://apim.rec.net/apis/api/images/v4/player/${encodeURIComponent(
+        const url = `https://apim.rec.net/apis/api/images/v4/player/${encodeURIComponent(
           accountId
         )}?skip=${skip}&take=${PHOTO_MAX_PAGE_SIZE}&sort=2`;
 
@@ -7365,6 +7366,310 @@ export class RecNetService extends EventEmitter {
     }
   }
 
+  /**
+   * Batch-scoped related-data sync for the SQLite-backed room capture path.
+   *
+   * Unlike {@link fetchAndSaveBulkData} (which re-derives IDs over the entire
+   * accumulated photo set and re-reads/re-writes JSON every batch), this only
+   * looks at the NEW batch's photos and only network-fetches accounts/rooms/
+   * events that the database has never seen — using O(batch) `getMissing*Ids`
+   * lookups. Results are UPSERTed into the database; JSON is produced once at
+   * the end via {@link exportRoomJsonFromDatabase}. Comments are intentionally
+   * skipped here (they are a deferred manual second pass).
+   */
+  private async syncRoomBatchRelatedData(
+    db: RoomDatabase,
+    batchPhotos: Photo[],
+    token: string | undefined,
+    options: BulkDataRefreshOptions
+  ): Promise<{
+    accountsFetched: number;
+    roomsFetched: number;
+    eventsFetched: number;
+    imageCommentsFetched: number;
+  }> {
+    const requestOptions = this.currentOperation
+      ? { signal: this.currentOperation.controller.signal }
+      : undefined;
+    const {
+      forceAccountsRefresh = false,
+      forceRoomsRefresh = false,
+      forceEventsRefresh = false,
+    } = options;
+
+    const normalizedPhotos = this.normalizePhotos(batchPhotos);
+    const { accountIds, roomIds, eventIds } =
+      this.extractUniqueIds(normalizedPhotos);
+
+    let accountsFetched = 0;
+    let roomsFetched = 0;
+    let eventsFetched = 0;
+
+    // --- Accounts -----------------------------------------------------------
+    const accountIdsArray = Array.from(accountIds);
+    const missingAccountIds = forceAccountsRefresh
+      ? accountIdsArray
+      : db.getMissingAccountIds(accountIdsArray);
+    if (missingAccountIds.length > 0) {
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        `Downloading account data (${missingAccountIds.length} new)...`,
+        0,
+        missingAccountIds.length,
+        0,
+        {
+          pageLabel: 'Accounts',
+          recentActivity: `Downloading ${missingAccountIds.length} new account record(s)...`,
+        }
+      );
+      const accountsData = await this.runMetadataRequestWithRetry({
+        label: 'account metadata',
+        source: 'room-photos',
+        operationRef: this.currentOperation ?? undefined,
+        pageLabel: 'Accounts',
+        recentActivity: 'Account metadata downloaded.',
+        operation: () =>
+          this.accountsController.fetchBulkAccounts(
+            missingAccountIds,
+            token,
+            requestOptions
+          ),
+      });
+      const normalizedAccounts = Array.isArray(accountsData)
+        ? this.normalizeAccounts(accountsData)
+        : [];
+      accountsFetched = normalizedAccounts.length;
+      if (normalizedAccounts.length > 0) {
+        db.upsertAccounts(normalizedAccounts);
+        await this.writeCentralAccountRecords(normalizedAccounts);
+      }
+    }
+
+    // --- Rooms --------------------------------------------------------------
+    const roomIdsArray = Array.from(roomIds);
+    const missingRoomIds = forceRoomsRefresh
+      ? roomIdsArray
+      : db.getMissingRoomIds(roomIdsArray);
+    if (missingRoomIds.length > 0) {
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        `Downloading room data (${missingRoomIds.length} new)...`,
+        0,
+        missingRoomIds.length,
+        0,
+        {
+          pageLabel: 'Rooms',
+          recentActivity: `Downloading ${missingRoomIds.length} new room record(s)...`,
+        }
+      );
+      const roomsData = await this.runMetadataRequestWithRetry({
+        label: 'room metadata',
+        source: 'room-photos',
+        operationRef: this.currentOperation ?? undefined,
+        pageLabel: 'Rooms',
+        recentActivity: 'Room metadata downloaded.',
+        operation: () =>
+          this.roomsController.fetchBulkRooms(
+            missingRoomIds,
+            token,
+            requestOptions
+          ),
+      });
+      const normalizedRooms = Array.isArray(roomsData)
+        ? this.normalizeRooms(roomsData)
+        : [];
+      roomsFetched = normalizedRooms.length;
+      if (normalizedRooms.length > 0) {
+        db.upsertRooms(normalizedRooms);
+      }
+    }
+
+    // --- Events -------------------------------------------------------------
+    const eventIdsArray = Array.from(eventIds);
+    const missingEventIds = forceEventsRefresh
+      ? eventIdsArray
+      : db.getMissingEventIds(eventIdsArray);
+    if (missingEventIds.length > 0) {
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        `Downloading event data (${missingEventIds.length} new)...`,
+        0,
+        missingEventIds.length,
+        0,
+        {
+          pageLabel: 'Events',
+          recentActivity: `Downloading ${missingEventIds.length} new event record(s)...`,
+        }
+      );
+      const eventsData = await this.runMetadataRequestWithRetry({
+        label: 'event metadata',
+        source: 'room-photos',
+        operationRef: this.currentOperation ?? undefined,
+        pageLabel: 'Events',
+        recentActivity: 'Event metadata downloaded.',
+        operation: () =>
+          this.eventsController.fetchBulkEvents(
+            missingEventIds,
+            token,
+            requestOptions
+          ),
+      });
+      const normalizedEvents = Array.isArray(eventsData)
+        ? this.normalizeEvents(eventsData)
+        : [];
+      eventsFetched = normalizedEvents.length;
+      if (normalizedEvents.length > 0) {
+        db.upsertEvents(normalizedEvents);
+      }
+    }
+
+    return {
+      accountsFetched,
+      roomsFetched,
+      eventsFetched,
+      imageCommentsFetched: 0,
+    };
+  }
+
+  /**
+   * One-time import of any pre-existing per-room JSON files into the SQLite
+   * database. Runs only when the database is still empty (e.g. the first batch
+   * after upgrading from the legacy JSON-as-DB capture). After this, JSON is
+   * treated purely as an export artifact.
+   */
+  private async migrateRoomJsonIntoDatabase(
+    db: RoomDatabase,
+    roomDir: string,
+    roomId: string
+  ): Promise<void> {
+    if (!db.isEmpty()) {
+      return;
+    }
+
+    const readJsonArray = async <T>(fileName: string): Promise<T[]> => {
+      const filePath = path.join(roomDir, fileName);
+      if (!(await fs.pathExists(filePath))) {
+        return [];
+      }
+      try {
+        const parsed = await fs.readJson(filePath);
+        return Array.isArray(parsed) ? (parsed as T[]) : [];
+      } catch (error) {
+        console.log(
+          `Warning: Failed to import ${fileName} into capture database: ${(error as Error).message}`
+        );
+        return [];
+      }
+    };
+
+    const existingPhotos = await readJsonArray<ImageDto>(
+      `${roomId}_photos.json`
+    );
+    if (existingPhotos.length > 0) {
+      db.upsertPhotos(this.normalizePhotos(existingPhotos));
+      // Photos imported from a previous capture already exist on disk.
+      db.setPhotosDownloaded(
+        existingPhotos
+          .map(photo => this.normalizeId(photo.Id))
+          .filter((id): id is string => !!id)
+          .map(id => ({ id }))
+      );
+    }
+
+    const existingAccounts = await readJsonArray<PlayerResult>(
+      `${roomId}_accounts.json`
+    );
+    if (existingAccounts.length > 0) {
+      db.upsertAccounts(this.normalizeAccounts(existingAccounts));
+    }
+
+    const existingRooms = await readJsonArray<RoomDto>(`${roomId}_rooms.json`);
+    if (existingRooms.length > 0) {
+      db.upsertRooms(this.normalizeRooms(existingRooms));
+    }
+
+    const existingEvents = await readJsonArray<EventDto>(
+      `${roomId}_events.json`
+    );
+    if (existingEvents.length > 0) {
+      db.upsertEvents(this.normalizeEvents(existingEvents));
+    }
+
+    const existingComments = await readJsonArray<ImageCommentDto>(
+      `${roomId}_image_comments.json`
+    );
+    if (existingComments.length > 0) {
+      db.upsertImageComments(existingComments);
+      // Mark every image that already has stored comments as fetched so the
+      // manual comments pass skips them.
+      const countsByImage = new Map<string, number>();
+      for (const comment of existingComments) {
+        const imageId = this.normalizeId(comment.SavedImageId);
+        if (imageId) {
+          countsByImage.set(imageId, (countsByImage.get(imageId) ?? 0) + 1);
+        }
+      }
+      for (const [imageId, count] of countsByImage) {
+        db.markCommentsFetched(imageId, count);
+      }
+    }
+  }
+
+  /**
+   * Regenerate the per-room JSON export files from the SQLite database. Called
+   * once when a room finishes capturing (or on demand). Produces byte-for-byte
+   * the same files the legacy path wrote incrementally, but without the O(N^2)
+   * per-batch rewrites.
+   */
+  private async exportRoomJsonFromDatabase(
+    db: RoomDatabase,
+    roomDir: string,
+    roomId: string
+  ): Promise<void> {
+    db.checkpoint();
+
+    await fs.writeJson(
+      path.join(roomDir, `${roomId}_photos.json`),
+      db.getAllPhotos(),
+      { spaces: 2 }
+    );
+
+    const accounts = db.getAllAccounts();
+    if (accounts.length > 0) {
+      await fs.writeJson(
+        path.join(roomDir, `${roomId}_accounts.json`),
+        accounts,
+        { spaces: 2 }
+      );
+    }
+
+    const rooms = db.getAllRooms();
+    if (rooms.length > 0) {
+      await fs.writeJson(path.join(roomDir, `${roomId}_rooms.json`), rooms, {
+        spaces: 2,
+      });
+    }
+
+    const events = db.getAllEvents();
+    if (events.length > 0) {
+      await fs.writeJson(path.join(roomDir, `${roomId}_events.json`), events, {
+        spaces: 2,
+      });
+    }
+
+    const comments = db.getAllImageComments();
+    if (comments.length > 0) {
+      await fs.writeJson(
+        path.join(roomDir, `${roomId}_image_comments.json`),
+        comments,
+        { spaces: 2 }
+      );
+    }
+  }
+
   async downloadRoomPhotoBatch(
     params: {
       roomName?: string;
@@ -7459,362 +7764,374 @@ export class RecNetService extends EventEmitter {
       const roomPhotoCursor =
         existingRoomMeta?.roomPhotoCursors?.[roomPhotoSort];
 
-      let existingPhotos: Photo[] = [];
-      if (await fs.pathExists(metadataPath)) {
-        try {
-          const existing = (await fs.readJson(metadataPath)) as ImageDto[];
-          existingPhotos = Array.isArray(existing)
-            ? this.normalizePhotos(existing)
-            : [];
-        } catch (error) {
-          console.log(
-            `Warning: Failed to read room photo metadata: ${(error as Error).message}`
+      // SQLite-backed incremental capture store. Replaces the legacy
+      // read-merge-rewrite of the entire `${roomId}_photos.json` on every batch.
+      const db = await RoomDatabase.open(roomDir);
+      try {
+        // One-time import of any pre-existing JSON from the legacy capture path.
+        await this.migrateRoomJsonIntoDatabase(db, roomDir, roomId);
+        // Ensure the room itself is stored for the final rooms.json export.
+        db.upsertRooms([room]);
+
+        const existingPhotoCount = db.countPhotos();
+
+        // Newest-first (default sort) auto runs always re-scan from the head
+        // (skip 0) so brand-new photos at the top of the feed are captured
+        // before resuming deep pagination. Other sort modes resume directly
+        // from their own saved cursor.
+        const isNewestFirstAutoRun =
+          requestedStartSkip === undefined &&
+          roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT;
+
+        const savedCursorSkip =
+          roomPhotoCursor?.nextSkip ??
+          (roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT
+            ? existingRoomMeta?.nextSkip
+            : undefined);
+        const inferredNextSkip =
+          roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT && existingPhotoCount > 0
+            ? Math.floor(existingPhotoCount / pageSize) * pageSize
+            : undefined;
+        const savedNextSkip = Math.max(
+          0,
+          Math.max(savedCursorSkip ?? 0, inferredNextSkip ?? 0)
+        );
+        const shouldResumeSavedCursor =
+          requestedStartSkip === undefined &&
+          roomPhotoSort !== ROOM_PHOTO_DEFAULT_SORT &&
+          savedNextSkip > 0;
+        const startSkip =
+          requestedStartSkip ??
+          (isNewestFirstAutoRun
+            ? 0
+            : shouldResumeSavedCursor
+              ? savedNextSkip
+              : 0);
+        const resumedFromSavedCursor =
+          requestedStartSkip === undefined && shouldResumeSavedCursor;
+
+        const batchPhotos: Photo[] = [];
+        let photosFetched = 0;
+        let pagesFetched = 0;
+        let hasMore = true;
+        let leadingNewPhotos = 0;
+        let reachedExistingPhoto = false;
+        // On a newest-first re-scan with prior progress, count the brand-new
+        // head photos until we reach one we already have, then jump the cursor
+        // past the previously-scanned (now downward-shifted) region.
+        let countingHeadInsertions = isNewestFirstAutoRun && savedNextSkip > 0;
+
+        for (let pageIndex = 0; pageIndex < batchPages; pageIndex++) {
+          if (operation.cancelled) {
+            throw this.createOperationCancelledError();
+          }
+
+          const skip = startSkip + pageIndex * pageSize;
+          const absolutePageNumber = Math.floor(skip / pageSize) + 1;
+          const pageLabel = `Room page ${absolutePageNumber}`;
+          const resumePrefix = resumedFromSavedCursor
+            ? `Resuming ${roomName} from saved page ${absolutePageNumber}`
+            : `Checking room page ${absolutePageNumber}`;
+          this.updateSourceProgress(
+            'metadata',
+            'room-photos',
+            'Collecting room photos metadata...',
+            pageIndex,
+            batchPages,
+            Math.round((pageIndex / batchPages) * 100),
+            {
+              pageLabel,
+              recentActivity: `${resumePrefix} for ${roomName}...`,
+            }
           );
+
+          const pagePhotos = this.normalizePhotos(
+            await this.runMetadataRequestWithRetry({
+              label: `room photos page ${absolutePageNumber}`,
+              source: 'room-photos',
+              operationRef: operation,
+              pageLabel,
+              recentActivity: `Collected room page ${absolutePageNumber} for ${roomName}.`,
+              operation: () =>
+                this.photosController.fetchRoomPhotos(
+                  roomId,
+                  { skip, take: pageSize, filter: 1, sort: roomPhotoSort },
+                  params.token,
+                  { signal: operation.controller.signal }
+                ),
+            })
+          );
+
+          pagesFetched++;
+          photosFetched += pagePhotos.length;
+          batchPhotos.push(...pagePhotos);
+
+          for (const photo of pagePhotos) {
+            const photoId = this.normalizeId(photo.Id);
+            if (photoId && countingHeadInsertions) {
+              // hasPhoto reflects the pre-batch DB state (this batch is upserted
+              // only after the page loop completes).
+              if (db.hasPhoto(photoId)) {
+                reachedExistingPhoto = true;
+                countingHeadInsertions = false;
+              } else {
+                leadingNewPhotos++;
+              }
+            }
+          }
+
+          if (pagePhotos.length < pageSize) {
+            hasMore = false;
+            break;
+          }
         }
-      }
 
-      const savedCursorSkip =
-        roomPhotoCursor?.nextSkip ??
-        (roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT
-          ? existingRoomMeta?.nextSkip
-          : undefined);
-      const inferredNextSkip =
-        roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT && existingPhotos.length > 0
-          ? Math.floor(existingPhotos.length / pageSize) * pageSize
-          : undefined;
-      const savedNextSkip = Math.max(
-        0,
-        Math.max(savedCursorSkip ?? 0, inferredNextSkip ?? 0)
-      );
-      const shouldResumeSavedCursor =
-        requestedStartSkip === undefined &&
-        roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT &&
-        savedNextSkip > 0;
-      const isFreshNewestFirstRun =
-        requestedStartSkip === undefined &&
-        roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT &&
-        !shouldResumeSavedCursor;
-      const startSkip =
-        requestedStartSkip ??
-        (shouldResumeSavedCursor ? savedNextSkip : 0);
-      const resumedFromSavedCursor =
-        requestedStartSkip === undefined && shouldResumeSavedCursor;
+        // Incremental UPSERT of just this batch — O(batch), not O(total).
+        const uniqueBatch = Array.from(
+          new Map(
+            this.normalizePhotos(batchPhotos).map(photo => [
+              this.normalizeId(photo.Id),
+              photo,
+            ])
+          ).values()
+        );
+        const upsertResult = db.upsertPhotos(uniqueBatch);
+        const newPhotosAdded = upsertResult.inserted;
 
-      const allPhotosById = new Map<string, Photo>();
-      const existingPhotoIds = new Set<string>();
-      for (const photo of existingPhotos) {
-        const photoId = this.normalizeId(photo.Id);
-        if (photoId) {
-          allPhotosById.set(photoId, photo);
-          existingPhotoIds.add(photoId);
+        // Fetch related accounts/rooms/events for ONLY the new batch's photos and
+        // UPSERT them into the database. Comments are deferred to the manual pass.
+        const relatedMetadata = await this.syncRoomBatchRelatedData(
+          db,
+          uniqueBatch,
+          params.token,
+          {
+            forceAccountsRefresh: params.forceAccountsRefresh,
+            forceRoomsRefresh: params.forceRoomsRefresh,
+            forceEventsRefresh: params.forceEventsRefresh,
+            forceImageCommentsRefresh: params.forceImageCommentsRefresh,
+          }
+        );
+
+        const uniqueBatchPhotos = Array.from(
+          new Map(
+            this.normalizePhotos(batchPhotos).map(photo => [photo.Id, photo])
+          ).values()
+        );
+        const downloadResults: DownloadResultItem[] = [];
+        const downloadStats: DownloadStats = {
+          totalPhotos: uniqueBatchPhotos.length,
+          alreadyDownloaded: 0,
+          newDownloads: 0,
+          failedDownloads: 0,
+          skipped: 0,
+          retryAttempts: 0,
+          recoveredAfterRetry: 0,
+        };
+
+        this.updateSourceProgress(
+          'download',
+          'room-photos',
+          'Downloading room photos...',
+          0,
+          uniqueBatchPhotos.length,
+          0
+        );
+
+        const trace = this.createDownloadBatchTrace(
+          'room-photo-downloads',
+          uniqueBatchPhotos.length
+        );
+        const semaphore = new Semaphore(this.settings.maxConcurrentDownloads);
+        let processedCount = 0;
+        const promises = uniqueBatchPhotos.map((photo, index) =>
+          (async (): Promise<DownloadResultItem> => {
+            await semaphore.acquire();
+            const scheduledIndex = index + 1;
+            const runStartedAt = Date.now();
+            const photoId = this.normalizeId(photo.Id);
+            const imageName = photo.ImageName;
+            trace.inFlight++;
+            this.logDownloadWorkerStart(trace, {
+              scheduledIndex,
+              photoId,
+              imageName,
+              scheduledDelayMs: 0,
+              slotWaitMs: 0,
+            });
+            let result: DownloadResultItem | undefined;
+            try {
+              this.setDownloadItemActivity(
+                'room-photos',
+                imageName || photoId || `image ${scheduledIndex}`
+              );
+              result = await this.downloadImageToDirectory(
+                photo,
+                photosDir,
+                params.token,
+                operation
+              );
+              const status = result.status;
+              if (status === 'downloaded') {
+                downloadStats.newDownloads++;
+                downloadStats.retryAttempts += (result.attempts || 1) - 1;
+                if (result.recoveredAfterRetry) {
+                  downloadStats.recoveredAfterRetry++;
+                }
+              } else if (status?.startsWith('already_exists')) {
+                downloadStats.alreadyDownloaded++;
+              } else if (status === 'failed' || status === 'error') {
+                downloadStats.failedDownloads++;
+                downloadStats.retryAttempts += (result.attempts || 1) - 1;
+              } else if (status === 'cancelled') {
+                downloadStats.skipped++;
+              }
+              return result;
+            } finally {
+              trace.inFlight = Math.max(0, trace.inFlight - 1);
+              trace.completed++;
+              this.logDownloadWorkerFinish(trace, {
+                scheduledIndex,
+                photoId,
+                imageName,
+                result,
+                runDurationMs: Date.now() - runStartedAt,
+              });
+              semaphore.release();
+              if (this.currentOperation === operation) {
+                processedCount++;
+                this.setDownloadResultActivity('room-photos', result);
+                this.updateSourceProgress(
+                  'download',
+                  'room-photos',
+                  'Downloading room photos...',
+                  processedCount,
+                  uniqueBatchPhotos.length
+                );
+              }
+            }
+          })()
+        );
+        downloadResults.push(...(await Promise.all(promises)));
+
+        // Persist download status into the capture database for images that are
+        // now present on disk (freshly downloaded or already existing). Results
+        // come back in the same order as uniqueBatchPhotos, so map by index to
+        // the original photo Id (the DB key) rather than the sanitized photoId.
+        const downloadedUpdates: { id: string; localFilePath?: string }[] = [];
+        downloadResults.forEach((result, index) => {
+          const status = result.status;
+          if (
+            status !== 'downloaded' &&
+            !status?.startsWith('already_exists')
+          ) {
+            return;
+          }
+          const id = this.normalizeId(uniqueBatchPhotos[index]?.Id);
+          if (!id) {
+            return;
+          }
+          downloadedUpdates.push({
+            id,
+            localFilePath: result.destinationPath ?? result.path,
+          });
+        });
+        if (downloadedUpdates.length > 0) {
+          db.setPhotosDownloaded(downloadedUpdates);
         }
-      }
 
-      const batchPhotos: Photo[] = [];
-      let photosFetched = 0;
-      let pagesFetched = 0;
-      let hasMore = true;
-      let leadingNewPhotos = 0;
-      let reachedExistingPhoto = false;
-      let countingHeadInsertions = isFreshNewestFirstRun && savedNextSkip > 0;
-
-      for (let pageIndex = 0; pageIndex < batchPages; pageIndex++) {
         if (operation.cancelled) {
           throw this.createOperationCancelledError();
         }
 
-        const skip = startSkip + pageIndex * pageSize;
-        const absolutePageNumber = Math.floor(skip / pageSize) + 1;
-        const pageLabel = `Room page ${absolutePageNumber}`;
-        const resumePrefix = resumedFromSavedCursor
-          ? `Resuming ${roomName} from saved page ${absolutePageNumber}`
-          : `Checking room page ${absolutePageNumber}`;
-        this.updateSourceProgress(
-          'metadata',
-          'room-photos',
-          'Collecting room photos metadata...',
-          pageIndex,
-          batchPages,
-          Math.round((pageIndex / batchPages) * 100),
-          {
-            pageLabel,
-            recentActivity: `${resumePrefix} for ${roomName}...`,
-          }
-        );
-
-        const pagePhotos = this.normalizePhotos(
-          await this.runMetadataRequestWithRetry({
-            label: `room photos page ${absolutePageNumber}`,
-            source: 'room-photos',
-            operationRef: operation,
-            pageLabel,
-            recentActivity: `Collected room page ${absolutePageNumber} for ${roomName}.`,
-            operation: () =>
-              this.photosController.fetchRoomPhotos(
-                roomId,
-                { skip, take: pageSize, filter: 1, sort: roomPhotoSort },
-                params.token,
-                { signal: operation.controller.signal }
-              ),
-          })
-        );
-
-        pagesFetched++;
-        photosFetched += pagePhotos.length;
-        batchPhotos.push(...pagePhotos);
-
-        for (const photo of pagePhotos) {
-          const photoId = this.normalizeId(photo.Id);
-          if (photoId && countingHeadInsertions) {
-            if (existingPhotoIds.has(photoId)) {
-              reachedExistingPhoto = true;
-              countingHeadInsertions = false;
-            } else {
-              leadingNewPhotos++;
-            }
-          }
-          if (photoId && !allPhotosById.has(photoId)) {
-            allPhotosById.set(photoId, photo);
-          }
-        }
-
-        if (pagePhotos.length < pageSize) {
-          hasMore = false;
-          break;
-        }
-      }
-
-      const normalizedAll = this.normalizePhotos(
-        Array.from(allPhotosById.values())
-      );
-      const newPhotosAdded = Math.max(
-        0,
-        normalizedAll.length - existingPhotos.length
-      );
-      await fs.writeJson(metadataPath, normalizedAll, { spaces: 2 });
-
-      const relatedMetadata = await this.fetchAndSaveBulkData(
-        roomId,
-        normalizedAll,
-        params.token,
-        {
-          forceAccountsRefresh: params.forceAccountsRefresh,
-          forceRoomsRefresh: params.forceRoomsRefresh,
-          forceEventsRefresh: params.forceEventsRefresh,
-          forceImageCommentsRefresh: params.forceImageCommentsRefresh,
-        },
-        'room-photos',
-        { directory: roomDir, fileStem: roomId, writeOwnerMeta: false }
-      );
-
-      const roomsJsonPath = path.join(roomDir, `${roomId}_rooms.json`);
-      let storedRooms: RoomDto[] = [];
-      if (await fs.pathExists(roomsJsonPath)) {
-        try {
-          const existingRooms = (await fs.readJson(roomsJsonPath)) as RoomDto[];
-          storedRooms = Array.isArray(existingRooms)
-            ? this.normalizeRooms(existingRooms)
-            : [];
-        } catch {
-          storedRooms = [];
-        }
-      }
-      const storedRoomsById = new Map<string, RoomDto>();
-      for (const storedRoom of storedRooms) {
-        const storedRoomId = this.normalizeId(storedRoom.RoomId);
-        if (storedRoomId) {
-          storedRoomsById.set(storedRoomId, storedRoom);
-        }
-      }
-      storedRoomsById.set(roomId, room);
-      await fs.writeJson(roomsJsonPath, Array.from(storedRoomsById.values()), {
-        spaces: 2,
-      });
-
-      const uniqueBatchPhotos = Array.from(
-        new Map(
-          this.normalizePhotos(batchPhotos).map(photo => [photo.Id, photo])
-        ).values()
-      );
-      const downloadResults: DownloadResultItem[] = [];
-      const downloadStats: DownloadStats = {
-        totalPhotos: uniqueBatchPhotos.length,
-        alreadyDownloaded: 0,
-        newDownloads: 0,
-        failedDownloads: 0,
-        skipped: 0,
-        retryAttempts: 0,
-        recoveredAfterRetry: 0,
-      };
-
-      this.updateSourceProgress(
-        'download',
-        'room-photos',
-        'Downloading room photos...',
-        0,
-        uniqueBatchPhotos.length,
-        0
-      );
-
-      const trace = this.createDownloadBatchTrace(
-        'room-photo-downloads',
-        uniqueBatchPhotos.length
-      );
-      const semaphore = new Semaphore(this.settings.maxConcurrentDownloads);
-      let processedCount = 0;
-      const promises = uniqueBatchPhotos.map((photo, index) =>
-        (async (): Promise<DownloadResultItem> => {
-          await semaphore.acquire();
-          const scheduledIndex = index + 1;
-          const runStartedAt = Date.now();
-          const photoId = this.normalizeId(photo.Id);
-          const imageName = photo.ImageName;
-          trace.inFlight++;
-          this.logDownloadWorkerStart(trace, {
-            scheduledIndex,
-            photoId,
-            imageName,
-            scheduledDelayMs: 0,
-            slotWaitMs: 0,
-          });
-          let result: DownloadResultItem | undefined;
-          try {
-            this.setDownloadItemActivity(
-              'room-photos',
-              imageName || photoId || `image ${scheduledIndex}`
-            );
-            result = await this.downloadImageToDirectory(
-              photo,
-              photosDir,
-              params.token,
-              operation
-            );
-            const status = result.status;
-            if (status === 'downloaded') {
-              downloadStats.newDownloads++;
-              downloadStats.retryAttempts += (result.attempts || 1) - 1;
-              if (result.recoveredAfterRetry) {
-                downloadStats.recoveredAfterRetry++;
-              }
-            } else if (status?.startsWith('already_exists')) {
-              downloadStats.alreadyDownloaded++;
-            } else if (status === 'failed' || status === 'error') {
-              downloadStats.failedDownloads++;
-              downloadStats.retryAttempts += (result.attempts || 1) - 1;
-            } else if (status === 'cancelled') {
-              downloadStats.skipped++;
-            }
-            return result;
-          } finally {
-            trace.inFlight = Math.max(0, trace.inFlight - 1);
-            trace.completed++;
-            this.logDownloadWorkerFinish(trace, {
-              scheduledIndex,
-              photoId,
-              imageName,
-              result,
-              runDurationMs: Date.now() - runStartedAt,
-            });
-            semaphore.release();
-            if (this.currentOperation === operation) {
-              processedCount++;
-              this.setDownloadResultActivity('room-photos', result);
-              this.updateSourceProgress(
-                'download',
-                'room-photos',
-                'Downloading room photos...',
-                processedCount,
-                uniqueBatchPhotos.length
-              );
-            }
-          }
-        })()
-      );
-      downloadResults.push(...(await Promise.all(promises)));
-
-      if (operation.cancelled) {
-        throw this.createOperationCancelledError();
-      }
-
-      const fetchedNextSkip = startSkip + pagesFetched * pageSize;
-      const canJumpPastPreviouslyScannedNewestPhotos =
-        isFreshNewestFirstRun && savedNextSkip > 0 && reachedExistingPhoto;
-      const nextSkip = canJumpPastPreviouslyScannedNewestPhotos
-        ? Math.max(fetchedNextSkip, savedNextSkip + leadingNewPhotos)
-        : fetchedNextSkip;
-      const hasMoreAfterJump = canJumpPastPreviouslyScannedNewestPhotos
-        ? roomPhotoCursor?.completed !== true
-        : hasMore;
-      const previouslyScannedPhotosSkipped =
-        canJumpPastPreviouslyScannedNewestPhotos
-          ? Math.max(0, nextSkip - fetchedNextSkip)
-          : 0;
-      const headPhotosChecked =
-        isFreshNewestFirstRun && savedNextSkip > 0 ? photosFetched : 0;
-      await this.writeRoomFolderMeta(roomDir, room, {
-        nextSkip:
-          roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT ? nextSkip : undefined,
-        roomPhotoCursors: {
-          [roomPhotoSort]: {
-            nextSkip,
-            completed: !hasMoreAfterJump,
-            updatedAt: new Date().toISOString(),
+        const fetchedNextSkip = startSkip + pagesFetched * pageSize;
+        const canJumpPastPreviouslyScannedNewestPhotos =
+          isNewestFirstAutoRun && savedNextSkip > 0 && reachedExistingPhoto;
+        const nextSkip = canJumpPastPreviouslyScannedNewestPhotos
+          ? Math.max(fetchedNextSkip, savedNextSkip + leadingNewPhotos)
+          : fetchedNextSkip;
+        const hasMoreAfterJump = canJumpPastPreviouslyScannedNewestPhotos
+          ? roomPhotoCursor?.completed !== true
+          : hasMore;
+        const previouslyScannedPhotosSkipped =
+          canJumpPastPreviouslyScannedNewestPhotos
+            ? Math.max(0, nextSkip - fetchedNextSkip)
+            : 0;
+        const headPhotosChecked =
+          isNewestFirstAutoRun && savedNextSkip > 0 ? photosFetched : 0;
+        await this.writeRoomFolderMeta(roomDir, room, {
+          nextSkip:
+            roomPhotoSort === ROOM_PHOTO_DEFAULT_SORT ? nextSkip : undefined,
+          roomPhotoCursors: {
+            [roomPhotoSort]: {
+              nextSkip,
+              completed: !hasMoreAfterJump,
+              updatedAt: new Date().toISOString(),
+            },
           },
-        },
-      });
-      if (this.settings.backgroundMetadataSyncEnabled) {
-        metadataProgress?.({
-          currentStep: 'Syncing room metadata images',
-          currentItemLabel: roomName,
-          current: 0,
-          total: 1,
-          downloadedAssets: 0,
-          skippedAssets: 0,
-          failedAssets: 0,
-          force: false,
         });
-        await this.syncRoomFolderMetadataAssets(
-          roomId,
-          false,
-          params.token,
-          createMetadataSyncAssetTracker(metadataProgress, false)
-        );
-        metadataProgress?.({
-          currentStep: 'Synced room metadata images',
-          currentItemLabel: roomName,
-          current: 1,
-          total: 1,
-          force: false,
-        });
-      }
-      this.logDownloadBatchSummary(trace, downloadStats);
-      this.setOperationComplete();
+        if (this.settings.backgroundMetadataSyncEnabled) {
+          metadataProgress?.({
+            currentStep: 'Syncing room metadata images',
+            currentItemLabel: roomName,
+            current: 0,
+            total: 1,
+            downloadedAssets: 0,
+            skippedAssets: 0,
+            failedAssets: 0,
+            force: false,
+          });
+          await this.syncRoomFolderMetadataAssets(
+            roomId,
+            false,
+            params.token,
+            createMetadataSyncAssetTracker(metadataProgress, false)
+          );
+          metadataProgress?.({
+            currentStep: 'Synced room metadata images',
+            currentItemLabel: roomName,
+            current: 1,
+            total: 1,
+            force: false,
+          });
+        }
+        const totalPhotos = db.countPhotos();
+        if (!hasMoreAfterJump) {
+          // Room finished capturing — regenerate the JSON export artifacts from
+          // the SQLite database in one pass (replacing per-batch JSON rewrites).
+          await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
+        }
 
-      return {
-        roomId,
-        roomName,
-        roomPhotoSort,
-        roomDirectory: roomDir,
-        photosDirectory: photosDir,
-        metadataPath,
-        startSkip,
-        nextSkip,
-        pageSize,
-        batchPages,
-        pagesFetched,
-        photosFetched,
-        newPhotosAdded,
-        headPhotosChecked,
-        previouslyScannedPhotosSkipped,
-        resumedFromSavedSkip: savedNextSkip > 0 ? savedNextSkip : undefined,
-        totalPhotos: normalizedAll.length,
-        hasMore: hasMoreAfterJump,
-        relatedMetadata,
-        downloadStats,
-        downloadResults,
-        totalResults: downloadResults.length,
-        guidance: this.buildDownloadGuidance('room photos', downloadStats),
-      };
+        this.logDownloadBatchSummary(trace, downloadStats);
+        this.setOperationComplete();
+
+        return {
+          roomId,
+          roomName,
+          roomPhotoSort,
+          roomDirectory: roomDir,
+          photosDirectory: photosDir,
+          metadataPath,
+          startSkip,
+          nextSkip,
+          pageSize,
+          batchPages,
+          pagesFetched,
+          photosFetched,
+          newPhotosAdded,
+          headPhotosChecked,
+          previouslyScannedPhotosSkipped,
+          resumedFromSavedSkip: savedNextSkip > 0 ? savedNextSkip : undefined,
+          totalPhotos,
+          hasMore: hasMoreAfterJump,
+          relatedMetadata,
+          downloadStats,
+          downloadResults,
+          totalResults: downloadResults.length,
+          guidance: this.buildDownloadGuidance('room photos', downloadStats),
+        };
+      } finally {
+        db.close();
+      }
     } catch (error) {
       if (!this.isOperationCancelledError(error)) {
         this.setOperationFailed((error as Error).message);
