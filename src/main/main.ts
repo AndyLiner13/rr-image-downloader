@@ -437,7 +437,6 @@ function getMyRoomsCandidatePaths(): string[] {
     path.join(path.resolve(app.getAppPath(), '..'), 'myrooms.json'),
     path.join(app.getAppPath(), 'myrooms.json'),
     path.join(path.resolve(__dirname, '..', '..', '..'), 'myrooms.json'),
-    'B:\\vsCode\\rr-exporter-2\\myrooms.json',
   ];
 
   return Array.from(

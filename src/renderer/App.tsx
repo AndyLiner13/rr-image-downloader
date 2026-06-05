@@ -77,7 +77,7 @@ const EMPTY_DOWNLOAD_STEP = 'Nothing to download';
 const CLEAN_DOWNLOAD_FOLLOW_UP =
   'If you take more photos in Rec Room, come back and run this download again. The app will only grab anything new.';
 const VIEWER_ONLY_RECHECK_MS = 60 * 60 * 1000;
-const DEFAULT_MYROOMS_MANIFEST_PATH = 'B:\\vsCode\\rr-exporter-2\\myrooms.json';
+const DEFAULT_MYROOMS_MANIFEST_PATH = '';
 
 /** Set to true to allow starting a library move from the debug menu. */
 const LIBRARY_MOVE_ENABLED = false;
