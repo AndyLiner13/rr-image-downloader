@@ -52,6 +52,54 @@ The default manifest path used by this workspace is:
 B:\vsCode\rr-exporter-2\myrooms.json
 ```
 
+### Getting `myrooms.json`
+
+The `myrooms.json` file comes from the Rec.net Data Extractor userscript:
+
+```text
+https://greasyfork.org/en/scripts/572412-rec-net-data-extractor
+```
+
+To export your owned rooms:
+
+1. Download and install Tampermonkey in your browser:
+
+   ```text
+   https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo
+   ```
+
+2. Visit the Tampermonkey extension page and enable **Allow User Scripts**:
+
+   ```text
+   chrome://extensions/?id=dhdgffkkebhmkfjojejmpbldmpobfkfo
+   ```
+
+3. Visit the Rec.net Data Extractor page:
+
+   ```text
+   https://greasyfork.org/en/scripts/572412-rec-net-data-extractor
+   ```
+
+4. Click the green **Install this script** button.
+
+5. On the Tampermonkey page it redirects to, click **Install**.
+
+   The page URL will look similar to:
+
+   ```text
+   chrome-extension://dhdgffkkebhmkfjojejmpbldmpobfkfo/ask.html?aid=something
+   ```
+
+6. Visit `rec.net`.
+
+7. Click the blue **Open Extractor** button at the bottom-left of the screen.
+
+   If you do not see the button, refresh `rec.net`.
+
+8. Click **Export Owned Rooms** at the top.
+
+That export produces the `myrooms.json` file that can be loaded in the **Room Photos** tab.
+
 ### Add Other Rooms
 
 Use **Add another room** with either:
