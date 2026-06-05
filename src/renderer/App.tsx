@@ -1,58 +1,58 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
 import { ArrowUp } from 'lucide-react';
-import { Button } from './components/ui/button';
+import {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
+import { DEFAULT_CDN_BASE } from '../shared/cdnUrl';
+import {
+    DEFAULT_DOWNLOAD_SOURCE_SELECTION,
+    DownloadSourceSelection,
+    getSelectedDownloadSources,
+} from '../shared/download-sources';
+import {
+    BulkDataRefreshOptions,
+    DownloadPreflightSummary,
+    DownloadResult,
+    EventDownloadIntent,
+    EventDownloadPanelPrefill,
+    EventPhotoBatchResult,
+    LibraryMode,
+    MetadataSyncState,
+    Progress,
+    RecNetSettings,
+    RoomDto,
+    RoomPhotoBatchResult,
+    RoomPhotoQueueProgress,
+    RoomPhotoSort,
+    UserFacingIncident,
+} from '../shared/types';
+import {
+    getViewerOnlyCutoffDate,
+    isViewerOnlyMode,
+} from '../shared/viewer-only-mode';
+import { CustomTitleBar } from './components/CustomTitleBar';
 import { DownloadPanel } from './components/DownloadPanel';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { ErrorRecoveryBanner } from './components/ErrorRecoveryBanner';
+import { LibraryMoveDialog } from './components/LibraryMoveDialog';
 import { PhotoViewer } from './components/PhotoViewer';
 import { ProgressDisplay } from './components/ProgressDisplay';
 import { StatsDialog } from './components/StatsDialog';
-import { CustomTitleBar } from './components/CustomTitleBar';
-import { LibraryMoveDialog } from './components/LibraryMoveDialog';
-import { ErrorBoundary } from './components/ErrorBoundary';
-import { DEFAULT_CDN_BASE } from '../shared/cdnUrl';
-import {
-  RecNetSettings,
-  Progress,
-  BulkDataRefreshOptions,
-  DownloadPreflightSummary,
-  DownloadResult,
-  UserFacingIncident,
-  LibraryMode,
-  RoomPhotoBatchResult,
-  RoomPhotoSort,
-  EventPhotoBatchResult,
-  EventDownloadIntent,
-  EventDownloadPanelPrefill,
-  MetadataSyncState,
-  RoomDto,
-  RoomPhotoQueueProgress,
-} from '../shared/types';
-import {
-  DownloadSourceSelection,
-  getSelectedDownloadSources,
-  DEFAULT_DOWNLOAD_SOURCE_SELECTION,
-} from '../shared/download-sources';
+import { Button } from './components/ui/button';
 import { FavoritesProvider } from './contexts/FavoritesContext';
 import {
-  createUserIncident,
-  createOutputFolderUnavailableIncident,
-  classifyError,
-  toOperationErrorData,
-} from './utils/errorPresentation';
-import { ErrorRecoveryBanner } from './components/ErrorRecoveryBanner';
-import {
-  buildDownloadProgressIncident,
-  getDownloadProgressLogEntries,
+    buildDownloadProgressIncident,
+    getDownloadProgressLogEntries,
 } from './utils/downloadProgressFeedback';
 import {
-  getViewerOnlyCutoffDate,
-  isViewerOnlyMode,
-} from '../shared/viewer-only-mode';
+    classifyError,
+    createOutputFolderUnavailableIncident,
+    createUserIncident,
+    toOperationErrorData,
+} from './utils/errorPresentation';
 
 interface DownloadRequestState {
   username: string;

@@ -1,49 +1,49 @@
 import {
-  app,
-  BrowserWindow,
-  ipcMain,
-  dialog,
-  IpcMainInvokeEvent,
-  Menu,
-  protocol,
-  shell,
+    app,
+    BrowserWindow,
+    dialog,
+    ipcMain,
+    IpcMainInvokeEvent,
+    Menu,
+    protocol,
+    shell,
 } from 'electron';
-import * as path from 'path';
-import * as fs from 'fs-extra';
 import { autoUpdater } from 'electron-updater';
-import { RecNetService } from './services/recnet-service';
-import {
-  CollectionResult,
-  DownloadPreflightSummary,
-  DownloadResult,
-  ProfileHistoryAccessResult,
-  ProfileHistoryCollectionResult,
-  RecNetSettings,
-  Progress,
-  AccountInfo,
-  AvailableEvent,
-  AvailableEventCreator,
-  AvailableRoom,
-  EventDiscoveryResult,
-  EventPhotoBatchResult,
-  Photo,
-  PhotoPageResult,
-  PlayerResult,
-  RoomDto,
-  RoomPhotoBatchResult,
-  RoomPhotoSort,
-  LibraryMoveResult,
-  MetadataSyncResult,
-  MyRoomsManifestResult,
-} from '../shared/types';
+import * as fs from 'fs-extra';
+import * as path from 'path';
 import type { DownloadSourceSelection } from '../shared/download-sources';
+import {
+    AccountInfo,
+    AvailableEvent,
+    AvailableEventCreator,
+    AvailableRoom,
+    CollectionResult,
+    DownloadPreflightSummary,
+    DownloadResult,
+    EventDiscoveryResult,
+    EventPhotoBatchResult,
+    LibraryMoveResult,
+    MetadataSyncResult,
+    MyRoomsManifestResult,
+    Photo,
+    PhotoPageResult,
+    PlayerResult,
+    ProfileHistoryAccessResult,
+    ProfileHistoryCollectionResult,
+    Progress,
+    RecNetSettings,
+    RoomDto,
+    RoomPhotoBatchResult,
+    RoomPhotoSort,
+} from '../shared/types';
+import {
+    isViewerOnlyMode,
+    VIEWER_ONLY_MODE_ERROR,
+} from '../shared/viewer-only-mode';
 import { EventDto } from './models/EventDto';
 import { ImageCommentDto } from './models/ImageCommentDto';
-import {
-  isViewerOnlyMode,
-  VIEWER_ONLY_MODE_ERROR,
-} from '../shared/viewer-only-mode';
 import { pathsEffectivelyEqual } from './services/library-move';
+import { RecNetService } from './services/recnet-service';
 
 // Keep a global reference of the window object
 let mainWindow: BrowserWindow | null = null;
@@ -1683,7 +1683,9 @@ ipcMain.handle(
       const favoriteIds =
         typeof params === 'string' ? undefined : params.favoriteIds;
       const anchorPhotoId =
-        typeof params === 'string' ? undefined : normalizeId(params.anchorPhotoId);
+        typeof params === 'string'
+          ? undefined
+          : normalizeId(params.anchorPhotoId);
       const anchorIndexInPage =
         typeof params === 'string'
           ? 0
@@ -1753,9 +1755,8 @@ ipcMain.handle(
         );
         if (anchorIndex >= 0) {
           resolvedOffset =
-            Math.floor(
-              Math.max(0, anchorIndex - anchorIndexInPage) / limit
-            ) * limit;
+            Math.floor(Math.max(0, anchorIndex - anchorIndexInPage) / limit) *
+            limit;
         }
       }
       resolvedOffset = Math.min(
