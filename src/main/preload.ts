@@ -22,6 +22,8 @@ const electronAPI: ElectronAPI = {
   lookupRoomById: params => ipcRenderer.invoke('lookup-room-by-id', params),
   downloadRoomPhotoBatch: params =>
     ipcRenderer.invoke('download-room-photo-batch', params),
+  downloadRoomPendingImages: params =>
+    ipcRenderer.invoke('download-room-pending-images', params),
   loadMyRoomsManifest: params =>
     ipcRenderer.invoke('load-my-rooms-manifest', params ?? {}),
   selectMyRoomsJson: () => ipcRenderer.invoke('select-my-rooms-json'),

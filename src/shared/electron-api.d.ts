@@ -2,37 +2,38 @@
  * Type declarations for the Electron preload API exposed to the renderer.
  * Keeps preload and renderer type-checking in sync with the main process IPC surface.
  */
-import type {
-  AccountInfo,
-  ApiResponse,
-  AvailableAccount,
-  AvailableEvent,
-  AvailableEventCreator,
-  AvailableRoom,
-  CollectionResult,
-  DownloadPreflightSummary,
-  DownloadResult,
-  EventDiscoveryResult,
-  EventPhotoBatchResult,
-  EventDto,
-  ImageCommentDto,
-  Photo,
-  PhotoPageResult,
-  ProfileHistoryAccessResult,
-  ProfileHistoryCollectionResult,
-  PlayerResult,
-  Progress,
-  RecNetSettings,
-  RoomDto,
-  RoomPhotoBatchResult,
-  RoomPhotoSort,
-  LibraryMoveProgress,
-  LibraryMoveResult,
-  MetadataSyncResult,
-  MetadataSyncState,
-  MyRoomsManifestResult,
-} from './types';
 import type { DownloadSourceSelection } from './download-sources';
+import type {
+    AccountInfo,
+    ApiResponse,
+    AvailableAccount,
+    AvailableEvent,
+    AvailableEventCreator,
+    AvailableRoom,
+    CollectionResult,
+    DownloadPreflightSummary,
+    DownloadResult,
+    EventDiscoveryResult,
+    EventDto,
+    EventPhotoBatchResult,
+    ImageCommentDto,
+    LibraryMoveProgress,
+    LibraryMoveResult,
+    MetadataSyncResult,
+    MetadataSyncState,
+    MyRoomsManifestResult,
+    Photo,
+    PhotoPageResult,
+    PlayerResult,
+    ProfileHistoryAccessResult,
+    ProfileHistoryCollectionResult,
+    Progress,
+    RecNetSettings,
+    RoomDto,
+    RoomPhotoBatchResult,
+    RoomPhotoDownloadResult,
+    RoomPhotoSort,
+} from './types';
 
 export interface ElectronAPI {
   collectPhotos: (params: {
@@ -95,11 +96,18 @@ export interface ElectronAPI {
     batchPages?: number;
     pageSize?: number;
     sort?: RoomPhotoSort;
+    metadataOnly?: boolean;
     forceAccountsRefresh?: boolean;
     forceRoomsRefresh?: boolean;
     forceEventsRefresh?: boolean;
     forceImageCommentsRefresh?: boolean;
   }) => Promise<ApiResponse<RoomPhotoBatchResult>>;
+  downloadRoomPendingImages: (params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+  }) => Promise<ApiResponse<RoomPhotoDownloadResult>>;
   loadMyRoomsManifest: (params?: {
     sourcePath?: string;
   }) => Promise<ApiResponse<MyRoomsManifestResult>>;

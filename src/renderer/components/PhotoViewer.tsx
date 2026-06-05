@@ -94,6 +94,10 @@ interface PhotoViewerProps {
 type PhotoSource = 'photos' | 'feed' | 'profile-history';
 const PHOTO_VIEW_PAGE_SIZE = 100;
 
+// How often (ms) to reload the room grid while a download is running so newly
+// downloaded photos appear live as the image pass commits them to the database.
+const ROOM_PHOTO_LIVE_REFRESH_INTERVAL = 1500;
+
 function formatCount(value: number): string {
   return value.toLocaleString();
 }
@@ -192,9 +196,6 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   });
   const internalScrollRef = useRef<HTMLDivElement | null>(null);
   const wasDownloadingRef = useRef(false);
-  // Tracks the `completedBatchCount` value at the last room-mode refresh so we
-  // can reload once per completed room photo batch.
-  const lastRefreshBatchCountRef = useRef(0);
   const photoLoadInFlightRef = useRef(false);
   const roomVisiblePhotosRef = useRef<Photo[]>([]);
   const roomPageWasManuallyChangedRef = useRef(false);
@@ -1008,31 +1009,29 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
     libraryMode,
   ]);
 
-  // Room mode: refresh the viewer once for every completed room photo batch,
-  // rather than on a fixed timer or a per-image count. `completedBatchCount` is
-  // the number of batches that have fully finished during the current run, so
-  // the grid updates when a batch completes instead of mid-scan as the next
-  // batch starts.
+  // Room mode: while a download is running, refresh the viewer on a short timer
+  // so newly downloaded photos appear live. The image download pass commits each
+  // photo to the database the moment its file lands, and the room grid only
+  // renders downloaded photos, so a periodic reload surfaces each new card in
+  // near real time as the exact-total progress bar advances. `completedBatchCount`
+  // is kept in the deps so a finished metadata batch also nudges a refresh.
   useEffect(() => {
-    if (libraryMode !== 'room') {
+    if (
+      libraryMode !== 'room' ||
+      !isDownloading ||
+      !activeLibraryId ||
+      !filePath
+    ) {
       return;
     }
 
-    if (!isDownloading || !activeLibraryId || !filePath) {
-      // Reset the baseline so the next run starts counting from zero.
-      lastRefreshBatchCountRef.current = completedBatchCount;
-      return;
-    }
-
-    // A new run restarts the batch counter; re-baseline if it went backwards.
-    if (completedBatchCount < lastRefreshBatchCountRef.current) {
-      lastRefreshBatchCountRef.current = completedBatchCount;
-    }
-
-    if (completedBatchCount > lastRefreshBatchCountRef.current) {
-      lastRefreshBatchCountRef.current = completedBatchCount;
+    const interval = setInterval(() => {
       void loadPhotos();
-    }
+    }, ROOM_PHOTO_LIVE_REFRESH_INTERVAL);
+
+    return () => {
+      clearInterval(interval);
+    };
   }, [
     libraryMode,
     isDownloading,

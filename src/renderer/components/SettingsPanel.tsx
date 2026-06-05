@@ -1,15 +1,16 @@
-import React from 'react';
 import { Settings as SettingsIcon } from 'lucide-react';
+import React from 'react';
+import { computeMaxConcurrencyForDelay } from '../../shared/concurrency';
+import { RecNetSettings } from '../../shared/types';
+import {
+    Card,
+    CardContent,
+    CardDescription,
+    CardHeader,
+    CardTitle,
+} from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '../components/ui/card';
-import { RecNetSettings } from '../../shared/types';
 import { OutputPathPickerGroup } from './OutputPathPickerGroup';
 
 interface SettingsPanelProps {
@@ -26,27 +27,45 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onUpdateSettings,
   onLog,
 }) => {
+  // The concurrency limit is a separate setting from the request delay, but its
+  // allowed maximum is derived from the delay. A faster delay permits more
+  // concurrent downloads; a slower delay lowers the ceiling.
+  const dynamicMaxConcurrency = computeMaxConcurrencyForDelay(
+    settings.interPageDelayMs ?? 0
+  );
+
   const handleDelayChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value.trim();
-    if (value === '') {
-      await onUpdateSettings({ interPageDelayMs: 100 });
-    } else {
-      const numValue = parseInt(value);
-      if (!isNaN(numValue)) {
-        const clampedValue = Math.min(1000, Math.max(0, numValue));
-        await onUpdateSettings({ interPageDelayMs: clampedValue });
-      }
+    const nextDelay = value === '' ? 100 : parseInt(value);
+    if (isNaN(nextDelay)) {
+      return;
     }
+    const clampedDelay = Math.min(1000, Math.max(0, nextDelay));
+    // Re-clamp the concurrency limit to the new delay's dynamic maximum so it
+    // never exceeds the bound after the delay changes.
+    const nextMaxConcurrency = computeMaxConcurrencyForDelay(clampedDelay);
+    const updates: Partial<RecNetSettings> = { interPageDelayMs: clampedDelay };
+    if (settings.maxConcurrentDownloads > nextMaxConcurrency) {
+      updates.maxConcurrentDownloads = nextMaxConcurrency;
+    }
+    await onUpdateSettings(updates);
   };
 
-  const handleMaxConcurrentChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMaxConcurrentChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
     const value = e.target.value.trim();
     if (value === '') {
-      await onUpdateSettings({ maxConcurrentDownloads: 3 });
+      await onUpdateSettings({
+        maxConcurrentDownloads: Math.min(3, dynamicMaxConcurrency),
+      });
     } else {
       const numValue = parseInt(value);
       if (!isNaN(numValue)) {
-        const clampedValue = Math.min(30, Math.max(1, numValue));
+        const clampedValue = Math.min(
+          dynamicMaxConcurrency,
+          Math.max(1, numValue)
+        );
         await onUpdateSettings({ maxConcurrentDownloads: clampedValue });
       }
     }
@@ -136,7 +155,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             max="1000"
           />
           <p className="text-sm text-muted-foreground">
-            Milliseconds between requests. Set to 0 for unlimited download speed.
+            Milliseconds between requests. Set to 0 for unlimited download
+            speed.
           </p>
         </div>
 
@@ -152,11 +172,14 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             value={settings.maxConcurrentDownloads}
             onChange={handleMaxConcurrentChange}
             min="1"
-            max="30"
+            max={dynamicMaxConcurrency}
           />
           <p className="text-sm text-muted-foreground">
-            Amount of images that can be downloaded concurrently. 
-            Lower this value if your downloads are consistently failing.
+            Amount of images that can be downloaded concurrently. The maximum is
+            tied to the request delay above &mdash; at the current delay of{' '}
+            {settings.interPageDelayMs ?? 0}ms the limit is{' '}
+            {dynamicMaxConcurrency}. Lower this value if your downloads are
+            consistently failing.
           </p>
         </div>
 

@@ -3,6 +3,7 @@ import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
 import { buildCdnImageUrl, DEFAULT_CDN_BASE } from '../../shared/cdnUrl';
+import { clampConcurrencyForDelay } from '../../shared/concurrency';
 import {
     DownloadSource,
     DownloadSourceSelection,
@@ -33,6 +34,7 @@ import {
     Progress,
     RecNetSettings,
     RoomPhotoBatchResult,
+    RoomPhotoDownloadResult,
     RoomPhotoSort,
 } from '../../shared/types';
 import { EventDto } from '../models/EventDto';
@@ -433,10 +435,18 @@ function normalizeRecNetSettings(input: unknown): RecNetSettings {
       : DEFAULT_SETTINGS.interPageDelayMs;
 
   const maxConcurrentRaw = raw.maxConcurrentDownloads;
-  const maxConcurrentDownloads =
+  const requestedMaxConcurrent =
     typeof maxConcurrentRaw === 'number' && Number.isFinite(maxConcurrentRaw)
-      ? Math.min(30, Math.max(1, Math.floor(maxConcurrentRaw)))
+      ? Math.floor(maxConcurrentRaw)
       : DEFAULT_SETTINGS.maxConcurrentDownloads;
+  // The concurrency limit and the request delay are independent settings, but
+  // the concurrency limit is given a dynamic upper bound derived from the delay
+  // so the two can't be configured into a nonsensical combination. A stored
+  // value above the current dynamic max is auto-clamped down.
+  const maxConcurrentDownloads = clampConcurrencyForDelay(
+    requestedMaxConcurrent,
+    interPageDelayMs ?? 100
+  );
 
   const maxRaw = raw.maxPhotosToDownload;
   const maxPhotosToDownload =
@@ -7680,6 +7690,13 @@ export class RecNetService extends EventEmitter {
       batchPages?: number;
       pageSize?: number;
       sort?: RoomPhotoSort;
+      /**
+       * Pass-1 (metadata) mode. When true the batch only captures photo
+       * metadata into the database and skips downloading any images. The
+       * separate {@link downloadRoomPendingImages} pass then downloads every
+       * not-yet-downloaded photo in a single queue with a real, known total.
+       */
+      metadataOnly?: boolean;
       forceAccountsRefresh?: boolean;
       forceRoomsRefresh?: boolean;
       forceEventsRefresh?: boolean;
@@ -7928,115 +7945,123 @@ export class RecNetService extends EventEmitter {
           recoveredAfterRetry: 0,
         };
 
-        this.updateSourceProgress(
-          'download',
-          'room-photos',
-          'Downloading room photos...',
-          0,
-          uniqueBatchPhotos.length,
-          0
-        );
-
+        // Pass-1 (metadata) batches only capture metadata; the dedicated
+        // download pass ({@link downloadRoomPendingImages}) fetches every
+        // not-yet-downloaded image afterwards in a single queue. Skip the entire
+        // download section here when running metadata-only.
         const trace = this.createDownloadBatchTrace(
           'room-photo-downloads',
           uniqueBatchPhotos.length
         );
-        const semaphore = new Semaphore(this.settings.maxConcurrentDownloads);
-        let processedCount = 0;
-        const promises = uniqueBatchPhotos.map((photo, index) =>
-          (async (): Promise<DownloadResultItem> => {
-            await semaphore.acquire();
-            const scheduledIndex = index + 1;
-            const runStartedAt = Date.now();
-            const photoId = this.normalizeId(photo.Id);
-            const imageName = photo.ImageName;
-            trace.inFlight++;
-            this.logDownloadWorkerStart(trace, {
-              scheduledIndex,
-              photoId,
-              imageName,
-              scheduledDelayMs: 0,
-              slotWaitMs: 0,
-            });
-            let result: DownloadResultItem | undefined;
-            try {
-              this.setDownloadItemActivity(
-                'room-photos',
-                imageName || photoId || `image ${scheduledIndex}`
-              );
-              result = await this.downloadImageToDirectory(
-                photo,
-                photosDir,
-                params.token,
-                operation
-              );
-              const status = result.status;
-              if (status === 'downloaded') {
-                downloadStats.newDownloads++;
-                downloadStats.retryAttempts += (result.attempts || 1) - 1;
-                if (result.recoveredAfterRetry) {
-                  downloadStats.recoveredAfterRetry++;
-                }
-              } else if (status?.startsWith('already_exists')) {
-                downloadStats.alreadyDownloaded++;
-              } else if (status === 'failed' || status === 'error') {
-                downloadStats.failedDownloads++;
-                downloadStats.retryAttempts += (result.attempts || 1) - 1;
-              } else if (status === 'cancelled') {
-                downloadStats.skipped++;
-              }
-              return result;
-            } finally {
-              trace.inFlight = Math.max(0, trace.inFlight - 1);
-              trace.completed++;
-              this.logDownloadWorkerFinish(trace, {
+        if (!params.metadataOnly) {
+          this.updateSourceProgress(
+            'download',
+            'room-photos',
+            'Downloading room photos...',
+            0,
+            uniqueBatchPhotos.length,
+            0
+          );
+
+          const semaphore = new Semaphore(this.settings.maxConcurrentDownloads);
+          let processedCount = 0;
+          const promises = uniqueBatchPhotos.map((photo, index) =>
+            (async (): Promise<DownloadResultItem> => {
+              await semaphore.acquire();
+              const scheduledIndex = index + 1;
+              const runStartedAt = Date.now();
+              const photoId = this.normalizeId(photo.Id);
+              const imageName = photo.ImageName;
+              trace.inFlight++;
+              this.logDownloadWorkerStart(trace, {
                 scheduledIndex,
                 photoId,
                 imageName,
-                result,
-                runDurationMs: Date.now() - runStartedAt,
+                scheduledDelayMs: 0,
+                slotWaitMs: 0,
               });
-              semaphore.release();
-              if (this.currentOperation === operation) {
-                processedCount++;
-                this.setDownloadResultActivity('room-photos', result);
-                this.updateSourceProgress(
-                  'download',
+              let result: DownloadResultItem | undefined;
+              try {
+                this.setDownloadItemActivity(
                   'room-photos',
-                  'Downloading room photos...',
-                  processedCount,
-                  uniqueBatchPhotos.length
+                  imageName || photoId || `image ${scheduledIndex}`
                 );
+                result = await this.downloadImageToDirectory(
+                  photo,
+                  photosDir,
+                  params.token,
+                  operation
+                );
+                const status = result.status;
+                if (status === 'downloaded') {
+                  downloadStats.newDownloads++;
+                  downloadStats.retryAttempts += (result.attempts || 1) - 1;
+                  if (result.recoveredAfterRetry) {
+                    downloadStats.recoveredAfterRetry++;
+                  }
+                } else if (status?.startsWith('already_exists')) {
+                  downloadStats.alreadyDownloaded++;
+                } else if (status === 'failed' || status === 'error') {
+                  downloadStats.failedDownloads++;
+                  downloadStats.retryAttempts += (result.attempts || 1) - 1;
+                } else if (status === 'cancelled') {
+                  downloadStats.skipped++;
+                }
+                return result;
+              } finally {
+                trace.inFlight = Math.max(0, trace.inFlight - 1);
+                trace.completed++;
+                this.logDownloadWorkerFinish(trace, {
+                  scheduledIndex,
+                  photoId,
+                  imageName,
+                  result,
+                  runDurationMs: Date.now() - runStartedAt,
+                });
+                semaphore.release();
+                if (this.currentOperation === operation) {
+                  processedCount++;
+                  this.setDownloadResultActivity('room-photos', result);
+                  this.updateSourceProgress(
+                    'download',
+                    'room-photos',
+                    'Downloading room photos...',
+                    processedCount,
+                    uniqueBatchPhotos.length
+                  );
+                }
               }
-            }
-          })()
-        );
-        downloadResults.push(...(await Promise.all(promises)));
+            })()
+          );
+          downloadResults.push(...(await Promise.all(promises)));
 
-        // Persist download status into the capture database for images that are
-        // now present on disk (freshly downloaded or already existing). Results
-        // come back in the same order as uniqueBatchPhotos, so map by index to
-        // the original photo Id (the DB key) rather than the sanitized photoId.
-        const downloadedUpdates: { id: string; localFilePath?: string }[] = [];
-        downloadResults.forEach((result, index) => {
-          const status = result.status;
-          if (
-            status !== 'downloaded' &&
-            !status?.startsWith('already_exists')
-          ) {
-            return;
-          }
-          const id = this.normalizeId(uniqueBatchPhotos[index]?.Id);
-          if (!id) {
-            return;
-          }
-          downloadedUpdates.push({
-            id,
-            localFilePath: result.destinationPath ?? result.path,
+          // Persist download status into the capture database for images that
+          // are now present on disk (freshly downloaded or already existing).
+          // Results come back in the same order as uniqueBatchPhotos, so map by
+          // index to the original photo Id (the DB key) rather than the
+          // sanitized photoId.
+          const downloadedUpdates: { id: string; localFilePath?: string }[] =
+            [];
+          downloadResults.forEach((result, index) => {
+            const status = result.status;
+            if (
+              status !== 'downloaded' &&
+              !status?.startsWith('already_exists')
+            ) {
+              return;
+            }
+            const id = this.normalizeId(uniqueBatchPhotos[index]?.Id);
+            if (!id) {
+              return;
+            }
+            downloadedUpdates.push({
+              id,
+              localFilePath: result.destinationPath ?? result.path,
+            });
           });
-        });
-        if (downloadedUpdates.length > 0) {
-          db.setPhotosDownloaded(downloadedUpdates);
+          if (downloadedUpdates.length > 0) {
+            db.setPhotosDownloaded(downloadedUpdates);
+          }
         }
 
         if (operation.cancelled) {
@@ -8095,9 +8120,11 @@ export class RecNetService extends EventEmitter {
           });
         }
         const totalPhotos = db.countPhotos();
-        if (!hasMoreAfterJump) {
+        if (!hasMoreAfterJump && !params.metadataOnly) {
           // Room finished capturing — regenerate the JSON export artifacts from
           // the SQLite database in one pass (replacing per-batch JSON rewrites).
+          // In metadata-only mode the export is deferred to the download pass so
+          // the JSON includes local image paths.
           await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
         }
 
@@ -8124,6 +8151,239 @@ export class RecNetService extends EventEmitter {
           totalPhotos,
           hasMore: hasMoreAfterJump,
           relatedMetadata,
+          downloadStats,
+          downloadResults,
+          totalResults: downloadResults.length,
+          guidance: this.buildDownloadGuidance('room photos', downloadStats),
+        };
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      if (!this.isOperationCancelledError(error)) {
+        this.setOperationFailed((error as Error).message);
+      }
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  /**
+   * Pass-2 image download for a room. Pass 1 ({@link downloadRoomPhotoBatch}
+   * with `metadataOnly: true`) captures every photo's metadata into the room's
+   * SQLite store; this pass then reads the exact set of not-yet-downloaded
+   * photos and fetches all of them through a single queue. Because the total is
+   * known up front, the GUI can show a real progress bar and surface each new
+   * card live as its image lands (the room grid only renders downloaded
+   * photos). Each successful download is committed to the database immediately
+   * so the renderer's `downloadedOnly` query picks it up in real time.
+   */
+  async downloadRoomPendingImages(params: {
+    roomName?: string;
+    roomId?: string;
+    room?: RoomDto;
+    token?: string;
+  }): Promise<RoomPhotoDownloadResult> {
+    await this.ensureSettingsLoaded();
+    const operation = this.startOperation();
+
+    try {
+      const suppliedRoom = params.room
+        ? this.normalizeRooms([params.room])[0]
+        : undefined;
+      const suppliedRoomId = this.normalizeId(
+        params.roomId ?? suppliedRoom?.RoomId
+      );
+      const suppliedRoomName = (
+        params.roomName ??
+        suppliedRoom?.Name ??
+        suppliedRoomId
+      ).trim();
+      if (!suppliedRoomId && !suppliedRoomName) {
+        throw new Error('Room name or room ID is required.');
+      }
+
+      this.resetProgressIssueState();
+      this.updateSourceProgress(
+        'metadata',
+        'room-photos',
+        'Preparing downloads...',
+        0,
+        0,
+        0,
+        {
+          recentActivity: suppliedRoomId
+            ? `Preparing room ${suppliedRoomName || suppliedRoomId}...`
+            : `Looking up room ${suppliedRoomName}...`,
+        }
+      );
+
+      const room =
+        suppliedRoomId && suppliedRoom
+          ? {
+              ...suppliedRoom,
+              RoomId: suppliedRoomId,
+              Name: suppliedRoom.Name || suppliedRoomName || suppliedRoomId,
+            }
+          : suppliedRoomId
+            ? this.normalizeRooms([
+                {
+                  ...(suppliedRoom ?? ({} as RoomDto)),
+                  RoomId: suppliedRoomId,
+                  Name: suppliedRoomName || suppliedRoomId,
+                } as RoomDto,
+              ])[0]
+            : await this.lookupRoomByName(suppliedRoomName, params.token);
+      const roomId = this.normalizeId(room.RoomId);
+      const roomName = room.Name || suppliedRoomName || roomId;
+      const roomDir = this.getRoomDirectory(roomId);
+      const photosDir = path.join(roomDir, 'photos');
+
+      await fs.ensureDir(roomDir);
+      await fs.ensureDir(photosDir);
+
+      const db = await RoomDatabase.open(roomDir);
+      try {
+        const pendingPhotos = db.getPendingDownloadPhotos();
+        const totalPending = pendingPhotos.length;
+
+        const downloadResults: DownloadResultItem[] = [];
+        const downloadStats: DownloadStats = {
+          totalPhotos: totalPending,
+          alreadyDownloaded: 0,
+          newDownloads: 0,
+          failedDownloads: 0,
+          skipped: 0,
+          retryAttempts: 0,
+          recoveredAfterRetry: 0,
+        };
+
+        this.updateSourceProgress(
+          'download',
+          'room-photos',
+          'Downloading room photos...',
+          0,
+          totalPending,
+          0
+        );
+
+        if (totalPending > 0) {
+          // The request delay and concurrency limit are independent settings,
+          // but the concurrency limit is bounded by the delay so the two can't
+          // combine into a nonsensical rate. Clamp the stored value to the
+          // delay-derived range before sizing the worker pool.
+          const concurrency = clampConcurrencyForDelay(
+            this.settings.maxConcurrentDownloads,
+            this.settings.interPageDelayMs ?? 100
+          );
+          const trace = this.createDownloadBatchTrace(
+            'room-pending-downloads',
+            totalPending
+          );
+          const semaphore = new Semaphore(Math.max(1, concurrency));
+          let processedCount = 0;
+
+          const promises = pendingPhotos.map((photo, index) =>
+            (async (): Promise<DownloadResultItem> => {
+              await semaphore.acquire();
+              const scheduledIndex = index + 1;
+              const runStartedAt = Date.now();
+              const photoId = this.normalizeId(photo.Id);
+              const imageName = photo.ImageName;
+              trace.inFlight++;
+              this.logDownloadWorkerStart(trace, {
+                scheduledIndex,
+                photoId,
+                imageName,
+                scheduledDelayMs: 0,
+                slotWaitMs: 0,
+              });
+              let result: DownloadResultItem | undefined;
+              try {
+                this.setDownloadItemActivity(
+                  'room-photos',
+                  imageName || photoId || `image ${scheduledIndex}`
+                );
+                result = await this.downloadImageToDirectory(
+                  photo,
+                  photosDir,
+                  params.token,
+                  operation
+                );
+                const status = result.status;
+                if (status === 'downloaded') {
+                  downloadStats.newDownloads++;
+                  downloadStats.retryAttempts += (result.attempts || 1) - 1;
+                  if (result.recoveredAfterRetry) {
+                    downloadStats.recoveredAfterRetry++;
+                  }
+                } else if (status?.startsWith('already_exists')) {
+                  downloadStats.alreadyDownloaded++;
+                } else if (status === 'failed' || status === 'error') {
+                  downloadStats.failedDownloads++;
+                  downloadStats.retryAttempts += (result.attempts || 1) - 1;
+                } else if (status === 'cancelled') {
+                  downloadStats.skipped++;
+                }
+                // Commit each successful image to the database immediately so
+                // the renderer's downloaded-only grid surfaces the new card in
+                // real time, rather than waiting for the whole pass to finish.
+                if (
+                  status === 'downloaded' ||
+                  status?.startsWith('already_exists')
+                ) {
+                  const id = this.normalizeId(photo.Id);
+                  if (id) {
+                    db.setPhotoDownloaded(
+                      id,
+                      result.destinationPath ?? result.path
+                    );
+                  }
+                }
+                return result;
+              } finally {
+                trace.inFlight = Math.max(0, trace.inFlight - 1);
+                trace.completed++;
+                this.logDownloadWorkerFinish(trace, {
+                  scheduledIndex,
+                  photoId,
+                  imageName,
+                  result,
+                  runDurationMs: Date.now() - runStartedAt,
+                });
+                semaphore.release();
+                if (this.currentOperation === operation) {
+                  processedCount++;
+                  this.setDownloadResultActivity('room-photos', result);
+                  this.updateSourceProgress(
+                    'download',
+                    'room-photos',
+                    'Downloading room photos...',
+                    processedCount,
+                    totalPending
+                  );
+                }
+              }
+            })()
+          );
+          downloadResults.push(...(await Promise.all(promises)));
+          this.logDownloadBatchSummary(trace, downloadStats);
+        }
+
+        // Regenerate the JSON export artifacts from the database now that the
+        // downloads (and their local file paths) are committed.
+        await this.exportRoomJsonFromDatabase(db, roomDir, roomId);
+
+        const totalPhotos = db.countPhotos();
+        this.setOperationComplete();
+
+        return {
+          roomId,
+          roomName,
+          roomDirectory: roomDir,
+          photosDirectory: photosDir,
+          totalPhotos,
           downloadStats,
           downloadResults,
           totalResults: downloadResults.length,

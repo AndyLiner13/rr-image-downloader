@@ -155,6 +155,7 @@ describe('RecNetService - Room Photo Batches', () => {
     const result = await service.downloadRoomPhotoBatch({
       roomName: 'TheRoomies',
       pageSize: 2,
+      batchPages: 5,
     });
 
     const roomDir = path.join(outputRoot, 'rooms', '2754290');

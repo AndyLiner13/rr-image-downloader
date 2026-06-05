@@ -375,6 +375,31 @@ export class RoomDatabase {
     return new Set(rows.map(r => r.id));
   }
 
+  /**
+   * All photos that have NOT yet been marked downloaded, in stable capture
+   * order. This is the work queue for the download pass: pass 1 captures every
+   * photo's metadata (each new row defaults to `downloaded = 0`), and pass 2
+   * pulls this list to know the exact set — and therefore exact total — of
+   * images that still need to be fetched.
+   */
+  getPendingDownloadPhotos(): Photo[] {
+    const rows = this.db
+      .prepare(
+        `SELECT data FROM photos WHERE downloaded = 0
+          ORDER BY created_at ASC, id ASC`
+      )
+      .all() as Array<{ data: string }>;
+    return rows.map(r => this.hydratePhoto(r.data));
+  }
+
+  /** Count of photos not yet marked downloaded (exact pass-2 work total). */
+  countPendingDownloads(): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM photos WHERE downloaded = 0`)
+      .get() as { c: number };
+    return toNumber(row?.c);
+  }
+
   countPhotos(downloadedOnly = false): number {
     const sql = downloadedOnly
       ? `SELECT COUNT(*) AS c FROM photos WHERE downloaded = 1`

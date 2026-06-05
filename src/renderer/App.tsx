@@ -19,6 +19,7 @@ import {
     RecNetSettings,
     RoomDto,
     RoomPhotoBatchResult,
+    RoomPhotoDownloadResult,
     RoomPhotoQueueProgress,
     RoomPhotoSort,
     UserFacingIncident,
@@ -816,9 +817,15 @@ function App() {
           let startSkip: number | undefined = undefined;
           let batchIndex = 0;
           let latestBatch: RoomPhotoBatchResult | null = null;
+          // Pass 1 — capture ALL photo metadata first (no image downloads).
+          // This loop drives the proven incremental/resume logic to completion
+          // so that afterwards we know the exact set of images to fetch.
           while (!stopRoomLoopRef.current) {
             batchIndex++;
-            addLog(`Collecting room photo batch ${batchIndex}...`, 'info');
+            addLog(
+              `Scanning room photo metadata (pass 1) — batch ${batchIndex}...`,
+              'info'
+            );
             const batchResult: {
               success: boolean;
               data?: RoomPhotoBatchResult;
@@ -830,6 +837,7 @@ function App() {
               batchPages: 10,
               pageSize: 100,
               sort: roomPhotoSort,
+              metadataOnly: true,
               forceAccountsRefresh,
               forceRoomsRefresh,
               forceEventsRefresh,
@@ -838,14 +846,13 @@ function App() {
 
             if (!batchResult.success || !batchResult.data) {
               throw new Error(
-                batchResult.error || 'Failed to download room photo batch'
+                batchResult.error || 'Failed to scan room photo metadata'
               );
             }
 
             const batchData = batchResult.data;
             latestBatch = batchData;
             startSkip = batchData.nextSkip;
-            addResult('Room Photos Batch', batchData, 'success');
             const skippedPreviouslyScanned =
               batchData.previouslyScannedPhotosSkipped ?? 0;
             const headPhotosChecked = batchData.headPhotosChecked ?? 0;
@@ -856,10 +863,8 @@ function App() {
                   ? ` Checked ${headPhotosChecked} latest image(s) before continuing.`
                   : '';
             addLog(
-              `Room batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s), ${batchData.downloadStats.newDownloads} downloaded.${resumeDetails}`,
-              batchData.downloadStats.failedDownloads > 0
-                ? 'warning'
-                : 'success'
+              `Metadata batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s).${resumeDetails}`,
+              'success'
             );
 
             if (!batchData.hasMore) {
@@ -867,7 +872,38 @@ function App() {
             }
           }
 
-          if (latestBatch) {
+          // Pass 2 — download every not-yet-downloaded image in a single queue
+          // with a known total, so the progress bar is exact and each finished
+          // card appears live in the grid as its image lands.
+          let downloadResult: RoomPhotoDownloadResult | null = null;
+          if (!stopRoomLoopRef.current) {
+            addLog('Downloading room photos (pass 2)...', 'info');
+            const pendingResult: {
+              success: boolean;
+              data?: RoomPhotoDownloadResult;
+              error?: string;
+            } = await window.electronAPI.downloadRoomPendingImages({
+              roomName: username,
+              token: token.trim() || undefined,
+            });
+
+            if (!pendingResult.success || !pendingResult.data) {
+              throw new Error(
+                pendingResult.error || 'Failed to download room photos'
+              );
+            }
+
+            downloadResult = pendingResult.data;
+            addResult('Room Photos', downloadResult, 'success');
+            addLog(
+              `Room photo download complete: ${downloadResult.downloadStats.newDownloads} downloaded, ${downloadResult.downloadStats.alreadyDownloaded} already on disk.`,
+              downloadResult.downloadStats.failedDownloads > 0
+                ? 'warning'
+                : 'success'
+            );
+          }
+
+          if (latestBatch || downloadResult) {
             addLog(
               stopRoomLoopRef.current
                 ? 'Room photo gathering stopped.'
@@ -1476,6 +1512,7 @@ function App() {
           let currentRoomPhotosDiscovered = 0;
           let latestBatch: RoomPhotoBatchResult | null = null;
 
+          // Pass 1 — scan ALL photo metadata for this room (no downloads yet).
           while (!stopRoomLoopRef.current) {
             batchIndex++;
             totalBatches++;
@@ -1487,13 +1524,13 @@ function App() {
               currentBatchCurrent: 0,
               currentBatchTotal: 0,
               currentBatchProgress: 0,
-              currentBatchLabel: `Batch ${batchIndex}`,
+              currentBatchLabel: `Scan ${batchIndex}`,
               currentRoomPhotosDiscovered,
-              message: `Room ${roomIndex + 1} of ${rooms.length}: scanning ^${roomName}; ${totalPhotosFetched.toLocaleString()} photo record(s) discovered so far.`,
+              message: `Room ${roomIndex + 1} of ${rooms.length}: scanning ^${roomName} metadata; ${totalPhotosFetched.toLocaleString()} photo record(s) discovered so far.`,
             };
             applyRoomPhotoQueueProgress(roomPhotoQueue);
             addLog(
-              `[${roomIndex + 1}/${rooms.length}] Collecting ^${roomName} batch ${batchIndex}...`,
+              `[${roomIndex + 1}/${rooms.length}] Scanning ^${roomName} metadata (pass 1) batch ${batchIndex}...`,
               'info'
             );
 
@@ -1507,6 +1544,7 @@ function App() {
                 batchPages: 10,
                 pageSize: 100,
                 sort: roomPhotoSort,
+                metadataOnly: true,
                 forceAccountsRefresh,
                 forceRoomsRefresh,
                 forceEventsRefresh,
@@ -1516,7 +1554,7 @@ function App() {
 
             if (!batchResult.success || !batchResult.data) {
               const errorMessage =
-                batchResult.error || 'Failed to download room photo batch';
+                batchResult.error || 'Failed to scan room photo metadata';
               if (
                 stopRoomLoopRef.current &&
                 /operation cancelled|cancelled/i.test(errorMessage)
@@ -1531,9 +1569,6 @@ function App() {
             startSkip = batchData.nextSkip;
             totalPhotosFetched += batchData.photosFetched;
             currentRoomPhotosDiscovered += batchData.photosFetched;
-            totalNewDownloads += batchData.downloadStats.newDownloads;
-            totalAlreadyDownloaded += batchData.downloadStats.alreadyDownloaded;
-            totalFailedDownloads += batchData.downloadStats.failedDownloads;
             roomPhotoQueue = {
               ...roomPhotoQueue,
               batchesCompleted: totalBatches,
@@ -1542,26 +1577,85 @@ function App() {
               currentBatchCurrent: batchData.photosFetched,
               currentBatchTotal: batchData.photosFetched,
               currentBatchProgress: 100,
-              currentBatchLabel: `Batch ${batchIndex} complete`,
+              currentBatchLabel: `Scan ${batchIndex} complete`,
               currentRoomPhotosDiscovered,
               photosDiscovered: totalPhotosFetched,
-              newDownloads: totalNewDownloads,
-              alreadyDownloaded: totalAlreadyDownloaded,
-              failedDownloads: totalFailedDownloads,
               hasMoreForCurrentRoom: batchData.hasMore,
               message: `Room ${roomIndex + 1} of ${rooms.length}: ^${roomName} has ${batchData.hasMore ? 'more photos to scan' : 'finished scanning'}; ${totalPhotosFetched.toLocaleString()} photo record(s) discovered across the queue.`,
             };
             applyRoomPhotoQueueProgress(roomPhotoQueue);
-            addResult(`Room Photos: ${roomName}`, batchData, 'success');
             addLog(
-              `^${roomName} batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s), ${batchData.downloadStats.newDownloads} downloaded.`,
-              batchData.downloadStats.failedDownloads > 0
-                ? 'warning'
-                : 'success'
+              `^${roomName} metadata batch ${batchIndex} complete: started at skip ${batchData.startSkip.toLocaleString()}, ${batchData.newPhotosAdded} new metadata record(s).`,
+              'success'
             );
 
             if (!batchData.hasMore) {
               break;
+            }
+          }
+
+          // Pass 2 — download every not-yet-downloaded image for this room in a
+          // single queue so the total is exact and finished cards appear live.
+          if (!stopRoomLoopRef.current && latestBatch) {
+            roomPhotoQueue = {
+              ...roomPhotoQueue,
+              currentBatch: undefined,
+              currentBatchFetched: undefined,
+              currentBatchCurrent: undefined,
+              currentBatchTotal: undefined,
+              currentBatchProgress: undefined,
+              currentBatchLabel: 'Downloading images',
+              currentRoomPhotosDiscovered,
+              message: `Room ${roomIndex + 1} of ${rooms.length}: downloading images for ^${roomName}...`,
+            };
+            applyRoomPhotoQueueProgress(roomPhotoQueue);
+            addLog(
+              `[${roomIndex + 1}/${rooms.length}] Downloading images for ^${roomName} (pass 2)...`,
+              'info'
+            );
+
+            const pendingResult =
+              await window.electronAPI.downloadRoomPendingImages({
+                roomId,
+                roomName,
+                room,
+                token: token.trim() || undefined,
+              });
+
+            if (!pendingResult.success || !pendingResult.data) {
+              const errorMessage =
+                pendingResult.error || 'Failed to download room photos';
+              if (
+                !(
+                  stopRoomLoopRef.current &&
+                  /operation cancelled|cancelled/i.test(errorMessage)
+                )
+              ) {
+                throw new Error(errorMessage);
+              }
+            } else {
+              const downloadData = pendingResult.data;
+              totalNewDownloads += downloadData.downloadStats.newDownloads;
+              totalAlreadyDownloaded +=
+                downloadData.downloadStats.alreadyDownloaded;
+              totalFailedDownloads +=
+                downloadData.downloadStats.failedDownloads;
+              roomPhotoQueue = {
+                ...roomPhotoQueue,
+                newDownloads: totalNewDownloads,
+                alreadyDownloaded: totalAlreadyDownloaded,
+                failedDownloads: totalFailedDownloads,
+                currentBatchLabel: undefined,
+                message: `Room ${roomIndex + 1} of ${rooms.length}: downloaded images for ^${roomName}.`,
+              };
+              applyRoomPhotoQueueProgress(roomPhotoQueue);
+              addResult(`Room Photos: ${roomName}`, downloadData, 'success');
+              addLog(
+                `^${roomName} download complete: ${downloadData.downloadStats.newDownloads} downloaded, ${downloadData.downloadStats.alreadyDownloaded} already on disk.`,
+                downloadData.downloadStats.failedDownloads > 0
+                  ? 'warning'
+                  : 'success'
+              );
             }
           }
 

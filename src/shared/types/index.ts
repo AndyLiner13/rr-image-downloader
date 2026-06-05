@@ -1,11 +1,11 @@
 import { EventDto } from '../../main/models/EventDto';
-import { ImageDto } from '../../main/models/ImageDto';
 import { ImageCommentDto } from '../../main/models/ImageCommentDto';
+import { ImageDto } from '../../main/models/ImageDto';
 import { PlayerResult } from '../../main/models/PlayerDto';
 import { RoomDto } from '../../main/models/RoomDto';
 import type { DownloadSource } from '../download-sources';
 
-export type { EventDto, ImageDto, ImageCommentDto, PlayerResult, RoomDto };
+export type { EventDto, ImageCommentDto, ImageDto, PlayerResult, RoomDto };
 
 export interface RecNetSettings {
   outputRoot: string;
@@ -364,6 +364,24 @@ export interface RoomPhotoBatchResult {
     eventsFetched: number;
     imageCommentsFetched: number;
   };
+  downloadStats: DownloadStats;
+  downloadResults: DownloadResultItem[];
+  totalResults: number;
+  guidance?: string[];
+}
+
+/**
+ * Result of the pass-2 image download for a room (see
+ * `downloadRoomPendingImages`). Pass 1 captures metadata; this pass downloads
+ * every not-yet-downloaded photo in the room's capture database in a single
+ * queue with a known total.
+ */
+export interface RoomPhotoDownloadResult {
+  roomId: string;
+  roomName: string;
+  roomDirectory: string;
+  photosDirectory: string;
+  totalPhotos: number;
   downloadStats: DownloadStats;
   downloadResults: DownloadResultItem[];
   totalResults: number;

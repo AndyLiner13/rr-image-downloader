@@ -34,6 +34,7 @@ import {
     RecNetSettings,
     RoomDto,
     RoomPhotoBatchResult,
+    RoomPhotoDownloadResult,
     RoomPhotoSort,
 } from '../shared/types';
 import {
@@ -251,10 +252,18 @@ interface DownloadRoomPhotoBatchParams {
   batchPages?: number;
   pageSize?: number;
   sort?: RoomPhotoSort;
+  metadataOnly?: boolean;
   forceAccountsRefresh?: boolean;
   forceRoomsRefresh?: boolean;
   forceEventsRefresh?: boolean;
   forceImageCommentsRefresh?: boolean;
+}
+
+interface DownloadRoomPendingImagesParams {
+  roomName?: string;
+  roomId?: string;
+  room?: RoomDto;
+  token?: string;
 }
 
 interface DiscoverEventsForUsernameParams {
@@ -1037,6 +1046,28 @@ ipcMain.handle(
         'Waiting for room metadata image sync',
         onProgress => recNetService.downloadRoomPhotoBatch(params, onProgress)
       );
+      return { success: true, data: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'download-room-pending-images',
+  async (
+    _event: IpcMainInvokeEvent,
+    params: DownloadRoomPendingImagesParams
+  ): Promise<ApiResponse<RoomPhotoDownloadResult>> => {
+    if (getViewerOnlyNetworkError()) {
+      return viewerOnlyApiResponse();
+    }
+    try {
+      const outputErr = await getOutputWriteBlockedError();
+      if (outputErr) {
+        return { success: false, error: outputErr };
+      }
+      const result = await recNetService.downloadRoomPendingImages(params);
       return { success: true, data: result };
     } catch (error) {
       return { success: false, error: (error as Error).message };
