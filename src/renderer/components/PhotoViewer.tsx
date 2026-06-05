@@ -1,53 +1,53 @@
-import React, {
-  useState,
-  useEffect,
-  useCallback,
-  useRef,
-  useMemo,
-} from 'react';
 import {
-  Search,
-  Filter,
-  ArrowUpDown,
-  Heart,
-  ArrowLeft,
-  Calendar,
-  Download,
-  Image as ImageIcon,
-  Users,
-  ChevronDown,
-  ChevronUp,
-  ChevronsLeft,
-  ChevronsRight,
+    ArrowLeft,
+    ArrowUpDown,
+    Calendar,
+    ChevronDown,
+    ChevronUp,
+    ChevronsLeft,
+    ChevronsRight,
+    Download,
+    Filter,
+    Heart,
+    Image as ImageIcon,
+    Search,
+    Users,
 } from 'lucide-react';
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
+import { DEFAULT_CDN_BASE } from '../../shared/cdnUrl';
+import type { EventDownloadIntent, LibraryMode } from '../../shared/types';
+import {
+    AvailableAccount,
+    AvailableEvent,
+    AvailableEventCreator,
+    AvailableRoom,
+    EventDto,
+    ImageCommentDto,
+    Photo,
+    PlayerResult,
+    RoomDto,
+} from '../../shared/types';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
 } from '../components/ui/select';
-import {
-  Photo,
-  AvailableAccount,
-  AvailableEvent,
-  AvailableEventCreator,
-  AvailableRoom,
-  EventDto,
-  ImageCommentDto,
-  RoomDto,
-  PlayerResult,
-} from '../../shared/types';
-import { DEFAULT_CDN_BASE } from '../../shared/cdnUrl';
-import { PhotoGrid } from './PhotoGrid';
-import { PhotoDetailModal } from './PhotoDetailModal';
-import { AccountSelect } from './AccountSelect';
 import { useFavorites } from '../hooks/useFavorites';
-import { RoomSelect } from './RoomSelect';
-import type { EventDownloadIntent, LibraryMode } from '../../shared/types';
+import { AccountSelect } from './AccountSelect';
 import { EventCoverImage } from './EventCoverImage';
+import { PhotoDetailModal } from './PhotoDetailModal';
+import { PhotoGrid } from './PhotoGrid';
+import { RoomSelect } from './RoomSelect';
 
 interface PhotoViewerProps {
   filePath: string;
@@ -56,6 +56,12 @@ interface PhotoViewerProps {
   eventCreatorId?: string;
   libraryMode?: LibraryMode;
   isDownloading?: boolean;
+  /**
+   * Cumulative number of images downloaded so far during the current run. Used
+   * in room mode to refresh the viewer once every
+   * {@link ROOM_PHOTO_REFRESH_IMAGE_INTERVAL} images instead of on a timer.
+   */
+  downloadedImageCount?: number;
   onAccountChange?: (accountId: string | undefined) => void;
   onRoomChange?: (roomId: string | undefined) => void;
   onEventCreatorChange?: (creatorAccountId: string | undefined) => void;
@@ -87,6 +93,13 @@ interface PhotoViewerProps {
 type PhotoSource = 'photos' | 'feed' | 'profile-history';
 const PHOTO_VIEW_PAGE_SIZE = 100;
 
+/**
+ * While a room download is running, reload the viewer once for every this many
+ * newly downloaded images (instead of on a fixed time interval). This keeps the
+ * "Download Progress" view fresh without re-querying on every small batch.
+ */
+const ROOM_PHOTO_REFRESH_IMAGE_INTERVAL = 1000;
+
 function formatCount(value: number): string {
   return value.toLocaleString();
 }
@@ -98,6 +111,7 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   eventCreatorId: propEventCreatorId,
   libraryMode = 'user',
   isDownloading = false,
+  downloadedImageCount = 0,
   onAccountChange,
   onRoomChange,
   onEventCreatorChange,
@@ -184,6 +198,9 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   });
   const internalScrollRef = useRef<HTMLDivElement | null>(null);
   const wasDownloadingRef = useRef(false);
+  // Tracks the `downloadedImageCount` value at the last room-mode refresh so we
+  // can reload once per ROOM_PHOTO_REFRESH_IMAGE_INTERVAL images downloaded.
+  const lastRefreshImageCountRef = useRef(0);
   const photoLoadInFlightRef = useRef(false);
   const roomVisiblePhotosRef = useRef<Photo[]>([]);
   const roomPageWasManuallyChangedRef = useRef(false);
@@ -231,17 +248,14 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   const totalPhotoPages = Math.max(
     1,
     Math.ceil(
-      (libraryMode === 'room'
-        ? photoTotalCount
-        : activePhotos.length) / PHOTO_VIEW_PAGE_SIZE
+      (libraryMode === 'room' ? photoTotalCount : activePhotos.length) /
+        PHOTO_VIEW_PAGE_SIZE
     )
   );
   const clampedPhotoPageIndex = Math.min(photoPageIndex, totalPhotoPages - 1);
   const photoPageStart = clampedPhotoPageIndex * PHOTO_VIEW_PAGE_SIZE;
   const activePhotoTotalCount =
-    libraryMode === 'room'
-      ? photoTotalCount
-      : activePhotos.length;
+    libraryMode === 'room' ? photoTotalCount : activePhotos.length;
   const visiblePhotoPage = useMemo(
     () =>
       libraryMode === 'room'
@@ -961,22 +975,24 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
     profileHistoryPhotos.length,
   ]);
 
-  // Reload photos + metadata periodically during download so names resolve
+  // Reload photos + metadata periodically during download so names resolve.
+  // Room mode uses a count-based trigger instead (see the effect below), so the
+  // timer here only covers user/event libraries.
   useEffect(() => {
     if (!isDownloading || !activeLibraryId || !filePath) {
       return;
     }
 
+    if (libraryMode === 'room') {
+      return;
+    }
+
     const interval = setInterval(() => {
-      if (libraryMode === 'room') {
-        void loadPhotos();
-      } else {
-        void loadPhotos();
-        void loadRoomData();
-        void loadAccountData();
-        void loadEventData();
-        void loadImageCommentsData();
-      }
+      void loadPhotos();
+      void loadRoomData();
+      void loadAccountData();
+      void loadEventData();
+      void loadImageCommentsData();
       if (libraryMode === 'event') {
         void loadAvailableEvents();
       }
@@ -996,6 +1012,41 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
     loadImageCommentsData,
     loadAvailableEvents,
     libraryMode,
+  ]);
+
+  // Room mode: refresh the viewer once for every ROOM_PHOTO_REFRESH_IMAGE_INTERVAL
+  // images downloaded, rather than on a fixed timer. `downloadedImageCount` is the
+  // cumulative count shown as "Downloaded" in the Download Progress panel.
+  useEffect(() => {
+    if (libraryMode !== 'room') {
+      return;
+    }
+
+    if (!isDownloading || !activeLibraryId || !filePath) {
+      // Reset the baseline so the next run starts counting from zero.
+      lastRefreshImageCountRef.current = downloadedImageCount;
+      return;
+    }
+
+    // A new run restarts the cumulative counter; re-baseline if it went backwards.
+    if (downloadedImageCount < lastRefreshImageCountRef.current) {
+      lastRefreshImageCountRef.current = downloadedImageCount;
+    }
+
+    if (
+      downloadedImageCount - lastRefreshImageCountRef.current >=
+      ROOM_PHOTO_REFRESH_IMAGE_INTERVAL
+    ) {
+      lastRefreshImageCountRef.current = downloadedImageCount;
+      void loadPhotos();
+    }
+  }, [
+    libraryMode,
+    isDownloading,
+    activeLibraryId,
+    filePath,
+    downloadedImageCount,
+    loadPhotos,
   ]);
 
   useEffect(() => {

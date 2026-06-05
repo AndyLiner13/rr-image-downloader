@@ -1,11 +1,5 @@
 import { ArrowUp } from 'lucide-react';
-import {
-    useCallback,
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CDN_BASE } from '../shared/cdnUrl';
 import {
     DEFAULT_DOWNLOAD_SOURCE_SELECTION,
@@ -833,7 +827,7 @@ function App() {
               roomName: username,
               token: token.trim() || undefined,
               startSkip,
-              batchPages: 5,
+              batchPages: 10,
               pageSize: 100,
               sort: roomPhotoSort,
               forceAccountsRefresh,
@@ -1510,7 +1504,7 @@ function App() {
                 room,
                 token: token.trim() || undefined,
                 startSkip,
-                batchPages: 5,
+                batchPages: 10,
                 pageSize: 100,
                 sort: roomPhotoSort,
                 forceAccountsRefresh,
@@ -2184,6 +2178,9 @@ function App() {
                 }
                 libraryMode={libraryMode}
                 isDownloading={isDownloading}
+                downloadedImageCount={
+                  progress.roomPhotoQueue?.newDownloads ?? 0
+                }
                 onAccountChange={handleViewerAccountChange}
                 onRoomChange={handleViewerRoomChange}
                 onScrollPositionChange={handlePhotoScroll}

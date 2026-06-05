@@ -196,6 +196,77 @@ describe('RoomDatabase', () => {
       expect(page.total).toBe(1);
       expect(page.photos[0].Id).toBe('2');
     });
+
+    it('filters to favorites only (empty favorites -> nothing)', () => {
+      const favs = db.getPhotosPage({
+        offset: 0,
+        limit: 10,
+        favoriteIds: ['1', '3'],
+      });
+      expect(favs.total).toBe(2);
+      expect(favs.photos.map(p => p.Id)).toEqual(['1', '3']);
+
+      const none = db.getPhotosPage({ offset: 0, limit: 10, favoriteIds: [] });
+      expect(none.total).toBe(0);
+      expect(none.photos).toHaveLength(0);
+    });
+
+    it('attaches the stored local_file_path to paged photos', () => {
+      db.setPhotosDownloaded([{ id: '2', localFilePath: '/imgs/2.jpg' }]);
+      const downloaded = db.getPhotosPage({
+        offset: 0,
+        limit: 10,
+        downloadedOnly: true,
+      });
+      expect(downloaded.total).toBe(1);
+      expect(downloaded.photos[0].Id).toBe('2');
+      expect(downloaded.photos[0].localFilePath).toBe('/imgs/2.jpg');
+    });
+  });
+
+  describe('getPhotoIndex (anchor offset resolution)', () => {
+    beforeEach(() => {
+      db.upsertPhotos([
+        makePhoto({ Id: '1', CreatedAt: '2026-01-01T00:00:00Z' }),
+        makePhoto({ Id: '2', CreatedAt: '2026-02-01T00:00:00Z' }),
+        makePhoto({ Id: '3', CreatedAt: '2026-03-01T00:00:00Z' }),
+        makePhoto({ Id: '4', CreatedAt: '2026-04-01T00:00:00Z' }),
+      ]);
+    });
+
+    it('returns the 0-based index in oldest-to-newest order', () => {
+      expect(db.getPhotoIndex({ anchorId: '1' })).toBe(0);
+      expect(db.getPhotoIndex({ anchorId: '3' })).toBe(2);
+      expect(db.getPhotoIndex({ anchorId: '4' })).toBe(3);
+    });
+
+    it('returns the index in newest-to-oldest order', () => {
+      expect(
+        db.getPhotoIndex({ anchorId: '4', sortBy: 'newest-to-oldest' })
+      ).toBe(0);
+      expect(
+        db.getPhotoIndex({ anchorId: '1', sortBy: 'newest-to-oldest' })
+      ).toBe(3);
+    });
+
+    it('matches the offset a paged scan would land on', () => {
+      const sorted = db
+        .getPhotosPage({ offset: 0, limit: 100 })
+        .photos.map(p => p.Id);
+      const anchorId = sorted[2];
+      const index = db.getPhotoIndex({ anchorId });
+      expect(index).toBe(2);
+      const page = db.getPhotosPage({ offset: index ?? 0, limit: 1 });
+      expect(page.photos[0].Id).toBe(anchorId);
+    });
+
+    it('returns null when the anchor is filtered out or unknown', () => {
+      expect(db.getPhotoIndex({ anchorId: 'nope' })).toBeNull();
+      // Not downloaded -> excluded by downloadedOnly filter.
+      expect(
+        db.getPhotoIndex({ anchorId: '2', downloadedOnly: true })
+      ).toBeNull();
+    });
   });
 
   describe('related entities', () => {

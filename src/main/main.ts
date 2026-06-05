@@ -44,6 +44,10 @@ import { EventDto } from './models/EventDto';
 import { ImageCommentDto } from './models/ImageCommentDto';
 import { pathsEffectivelyEqual } from './services/library-move';
 import { RecNetService } from './services/recnet-service';
+import {
+    RoomDatabase,
+    type PhotoSortBy,
+} from './services/storage/room-database';
 
 // Keep a global reference of the window object
 let mainWindow: BrowserWindow | null = null;
@@ -1698,7 +1702,88 @@ ipcMain.handle(
         return { success: true, data: { photos: [], total: 0, offset, limit } };
       }
       const roomDir = path.join(root, 'rooms', roomId);
+      const photosDir = path.join(roomDir, 'photos');
       const jsonPath = path.join(roomDir, `${roomId}_photos.json`);
+
+      // DB-primary fast path. The SQLite capture store (`capture.sqlite`) is the
+      // live source of truth: the per-room `*_photos.json` export is only
+      // (re)written when a capture finishes, so during an in-progress capture it
+      // is stale or absent. Paging straight from SQLite also avoids loading a
+      // multi-megabyte JSON array into main-process memory for huge rooms.
+      const dbPath = RoomDatabase.getDatabasePath(roomDir);
+      if (await fs.pathExists(dbPath)) {
+        const db = await RoomDatabase.open(roomDir);
+        try {
+          const sortKey = sortBy as PhotoSortBy | undefined;
+          // Total (and a cheap existence probe) for the current filter set.
+          const total = db.getPhotosPage({
+            offset: 0,
+            limit: 1,
+            sortBy: sortKey,
+            searchQuery,
+            favoriteIds,
+            downloadedOnly: true,
+          }).total;
+
+          // Resolve the page offset using the same precedence as the JSON path:
+          // preferLatest > anchorPhotoId > explicit offset, then clamp.
+          let resolvedOffset = offset;
+          if (preferLatest) {
+            resolvedOffset =
+              sortBy === 'newest-to-oldest' ? 0 : Math.max(0, total - limit);
+          } else if (anchorPhotoId) {
+            const anchorIndex = db.getPhotoIndex({
+              anchorId: anchorPhotoId,
+              sortBy: sortKey,
+              searchQuery,
+              favoriteIds,
+              downloadedOnly: true,
+            });
+            if (anchorIndex !== null && anchorIndex >= 0) {
+              resolvedOffset =
+                Math.floor(
+                  Math.max(0, anchorIndex - anchorIndexInPage) / limit
+                ) * limit;
+            }
+          }
+          resolvedOffset = Math.min(
+            Math.max(0, resolvedOffset),
+            Math.max(0, total - 1)
+          );
+
+          const page = db.getPhotosPage({
+            offset: resolvedOffset,
+            limit,
+            sortBy: sortKey,
+            searchQuery,
+            favoriteIds,
+            downloadedOnly: true,
+          });
+
+          // `getPhotosPage` already attaches the stored `local_file_path`; fall
+          // back to the canonical `${photosDir}/${id}.jpg` convention for any
+          // legacy row that was marked downloaded without recording a path.
+          const photos = page.photos.map(photo => {
+            if (photo.localFilePath) {
+              return photo;
+            }
+            const photoId = normalizeId(photo.Id);
+            return photoId
+              ? {
+                  ...photo,
+                  localFilePath: path.join(photosDir, `${photoId}.jpg`),
+                }
+              : photo;
+          });
+
+          return {
+            success: true,
+            data: { photos, total, offset: resolvedOffset, limit },
+          };
+        } finally {
+          db.close();
+        }
+      }
 
       if (!(await fs.pathExists(jsonPath))) {
         return { success: true, data: { photos: [], total: 0, offset, limit } };
@@ -1708,7 +1793,6 @@ ipcMain.handle(
       const photos = Array.isArray(rawPhotos)
         ? rawPhotos.map(normalizePhotoRecord)
         : [];
-      const photosDir = path.join(roomDir, 'photos');
       const photoFilePathById = new Map<string, string>();
 
       if (await fs.pathExists(photosDir)) {

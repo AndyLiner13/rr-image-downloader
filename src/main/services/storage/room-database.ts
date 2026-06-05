@@ -44,13 +44,28 @@ export type PhotoSortBy =
   | 'most-cheered'
   | 'most-comments';
 
-export interface PhotoPageQuery {
-  offset: number;
-  limit: number;
-  sortBy?: PhotoSortBy;
+export interface PhotoFilterQuery {
   searchQuery?: string;
   /** When set, only return photos that have already been downloaded locally. */
   downloadedOnly?: boolean;
+  /**
+   * When provided (even as an empty array), restricts results to photos whose
+   * id is in this set — mirrors the renderer's "favorites only" view. An empty
+   * array therefore yields no results.
+   */
+  favoriteIds?: string[];
+}
+
+export interface PhotoPageQuery extends PhotoFilterQuery {
+  offset: number;
+  limit: number;
+  sortBy?: PhotoSortBy;
+}
+
+export interface PhotoIndexQuery extends PhotoFilterQuery {
+  /** The photo whose position within the sorted/filtered set we want. */
+  anchorId: string;
+  sortBy?: PhotoSortBy;
 }
 
 export interface PhotoPage {
@@ -369,12 +384,13 @@ export class RoomDatabase {
   }
 
   /**
-   * Paged, sorted, optionally-searched photo query — replaces loading the whole
-   * `*_photos.json` into renderer memory.
+   * Build the shared `WHERE` clause (and bound args) for photo queries so that
+   * paging, counting and anchor-index resolution all filter identically.
    */
-  getPhotosPage(query: PhotoPageQuery): PhotoPage {
-    const limit = Math.max(1, Math.floor(query.limit));
-    const offset = Math.max(0, Math.floor(query.offset));
+  private buildPhotoFilter(query: PhotoFilterQuery): {
+    whereSql: string;
+    args: Array<string | number>;
+  } {
     const where: string[] = [];
     const args: Array<string | number> = [];
 
@@ -386,24 +402,49 @@ export class RoomDatabase {
       where.push('(LOWER(image_name) LIKE ? OR LOWER(description) LIKE ?)');
       args.push(like, like);
     }
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    if (query.favoriteIds !== undefined) {
+      const ids = query.favoriteIds
+        .map(id => normalizeIdValue(id))
+        .filter(Boolean);
+      if (ids.length === 0) {
+        // "Favorites only" with no favorites -> match nothing.
+        where.push('0');
+      } else {
+        where.push(`id IN (${ids.map(() => '?').join(', ')})`);
+        args.push(...ids);
+      }
+    }
 
-    let orderSql: string;
-    switch (query.sortBy) {
+    return {
+      whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+      args,
+    };
+  }
+
+  /** Map a sort key to its `ORDER BY` clause (id is the deterministic tie-break). */
+  private buildPhotoOrder(sortBy?: PhotoSortBy): string {
+    switch (sortBy) {
       case 'newest-to-oldest':
-        orderSql = 'ORDER BY created_at DESC, id DESC';
-        break;
+        return 'ORDER BY created_at DESC, id DESC';
       case 'most-cheered':
-        orderSql = 'ORDER BY cheer_count DESC, created_at DESC';
-        break;
+        return 'ORDER BY cheer_count DESC, created_at DESC, id DESC';
       case 'most-comments':
-        orderSql = 'ORDER BY comment_count DESC, created_at DESC';
-        break;
+        return 'ORDER BY comment_count DESC, created_at DESC, id DESC';
       case 'oldest-to-newest':
       default:
-        orderSql = 'ORDER BY created_at ASC, id ASC';
-        break;
+        return 'ORDER BY created_at ASC, id ASC';
     }
+  }
+
+  /**
+   * Paged, sorted, optionally-searched photo query — replaces loading the whole
+   * `*_photos.json` into renderer memory.
+   */
+  getPhotosPage(query: PhotoPageQuery): PhotoPage {
+    const limit = Math.max(1, Math.floor(query.limit));
+    const offset = Math.max(0, Math.floor(query.offset));
+    const { whereSql, args } = this.buildPhotoFilter(query);
+    const orderSql = this.buildPhotoOrder(query.sortBy);
 
     const totalRow = this.db
       .prepare(`SELECT COUNT(*) AS c FROM photos ${whereSql}`)
@@ -412,12 +453,87 @@ export class RoomDatabase {
 
     const rows = this.db
       .prepare(
-        `SELECT data FROM photos ${whereSql} ${orderSql} LIMIT ? OFFSET ?`
+        `SELECT data, local_file_path AS localFilePath
+           FROM photos ${whereSql} ${orderSql} LIMIT ? OFFSET ?`
       )
-      .all(...args, limit, offset) as Array<{ data: string }>;
+      .all(...args, limit, offset) as Array<{
+      data: string;
+      localFilePath: string | null;
+    }>;
 
-    const photos = rows.map(r => this.hydratePhoto(r.data));
+    const photos = rows.map(r => this.hydratePhoto(r.data, r.localFilePath));
     return { photos, total, offset, limit };
+  }
+
+  /**
+   * Resolve the 0-based index of `anchorId` within the same sorted/filtered set
+   * `getPhotosPage` would produce, by counting the rows that sort strictly
+   * before it. Returns `null` when the anchor is absent from the filtered set
+   * (e.g. not downloaded, filtered out by search/favorites, or unknown id).
+   */
+  getPhotoIndex(query: PhotoIndexQuery): number | null {
+    const anchorId = normalizeIdValue(query.anchorId);
+    if (!anchorId) {
+      return null;
+    }
+
+    const { whereSql, args } = this.buildPhotoFilter(query);
+    const idClause = whereSql ? `${whereSql} AND id = ?` : 'WHERE id = ?';
+    const anchor = this.db
+      .prepare(
+        `SELECT created_at AS createdAt, cheer_count AS cheerCount,
+                comment_count AS commentCount
+           FROM photos ${idClause}`
+      )
+      .get(...args, anchorId) as
+      | { createdAt: string | null; cheerCount: number; commentCount: number }
+      | undefined;
+    if (!anchor) {
+      return null;
+    }
+
+    const createdAt = anchor.createdAt ?? '';
+    const cheer = toNumber(anchor.cheerCount);
+    const comments = toNumber(anchor.commentCount);
+
+    let beforeSql: string;
+    const beforeArgs: Array<string | number> = [];
+    switch (query.sortBy) {
+      case 'newest-to-oldest':
+        beforeSql = '(created_at > ? OR (created_at = ? AND id > ?))';
+        beforeArgs.push(createdAt, createdAt, anchorId);
+        break;
+      case 'most-cheered':
+        beforeSql =
+          '(cheer_count > ? OR (cheer_count = ? AND created_at > ?) OR (cheer_count = ? AND created_at = ? AND id > ?))';
+        beforeArgs.push(cheer, cheer, createdAt, cheer, createdAt, anchorId);
+        break;
+      case 'most-comments':
+        beforeSql =
+          '(comment_count > ? OR (comment_count = ? AND created_at > ?) OR (comment_count = ? AND created_at = ? AND id > ?))';
+        beforeArgs.push(
+          comments,
+          comments,
+          createdAt,
+          comments,
+          createdAt,
+          anchorId
+        );
+        break;
+      case 'oldest-to-newest':
+      default:
+        beforeSql = '(created_at < ? OR (created_at = ? AND id < ?))';
+        beforeArgs.push(createdAt, createdAt, anchorId);
+        break;
+    }
+
+    const beforeWhere = whereSql
+      ? `${whereSql} AND ${beforeSql}`
+      : `WHERE ${beforeSql}`;
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM photos ${beforeWhere}`)
+      .get(...args, ...beforeArgs) as { c: number };
+    return toNumber(row?.c);
   }
 
   /** All photos in stable order — used to regenerate the export JSON. */
@@ -428,8 +544,11 @@ export class RoomDatabase {
     return rows.map(r => this.hydratePhoto(r.data));
   }
 
-  private hydratePhoto(data: string): Photo {
+  private hydratePhoto(data: string, localFilePath?: string | null): Photo {
     const parsed = JSON.parse(data) as Photo;
+    if (localFilePath) {
+      parsed.localFilePath = localFilePath;
+    }
     return parsed;
   }
 

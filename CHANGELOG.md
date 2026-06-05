@@ -39,6 +39,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-room JSON into the new database on first capture, so existing room folders
   keep working.
 
+#### SQLite-backed room photo viewer paging
+
+- **The room photo viewer now pages directly from `capture.sqlite`** instead of
+  reading the entire `*_photos.json` into main-process memory on every page. The
+  `load-room-photos` IPC handler is **DB-primary**: when a room's
+  `capture.sqlite` exists it serves each page via `RoomDatabase.getPhotosPage`
+  (filtered to downloaded photos), and only falls back to the legacy JSON scan
+  for rooms with no database. This makes the viewer responsive on rooms with
+  tens of thousands of images and lets you browse a room **while it is still
+  being captured** (the JSON export does not exist until capture finishes).
+- **`RoomDatabase` query extensions** to preserve the viewer's full behavior on
+  the DB path: `getPhotosPage` now supports a `favoriteIds` filter (favorites-only
+  view) and returns each photo's stored `local_file_path`; the new
+  `getPhotoIndex` resolves an anchor photo's position within the sorted/filtered
+  set so "keep my scroll position while new photos stream in" (`anchorPhotoId` /
+  `preferLatest`) works without loading the whole room.
+
 ### Changed
 
 - **Electron 28 → 38** and **electron-builder 24 → 26**; `@types/node` aligned to
