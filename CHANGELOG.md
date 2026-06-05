@@ -15,6 +15,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > reconstructed by diffing the fork against the upstream **v4.0.7** tag
 > (`git diff v4.0.7 main` — **17 files changed, +2,578 / −528 lines**).
 
+## [Unreleased]
+
+### Added
+
+#### Incremental SQLite capture store (room photo overhaul)
+
+- **New `RoomDatabase` storage layer** (`src/main/services/storage/room-database.ts`)
+  backed by the Node built-in **`node:sqlite`** module (`DatabaseSync`) — no
+  native addon, no ABI rebuild. Each room captures into a `capture.sqlite`
+  database (WAL mode, `synchronous=NORMAL`, `busy_timeout=5000`) with tables for
+  photos, accounts, rooms, events, and image comments, plus indexed columns for
+  sorting/searching and a verbatim `data` JSON blob per record for byte-identical
+  export.
+- **Incremental capture.** `downloadRoomPhotoBatch` now writes each batch as a
+  small `upsert` into SQLite instead of repeatedly loading and rewriting the
+  entire accumulating `*_photos.json`. The familiar JSON files are exported once,
+  at the end of a completed capture, via `exportRoomJsonFromDatabase` — output is
+  byte-identical to the previous behavior (`normalizePhotos` blobs reproduce the
+  exact same fields; `JSON.stringify` drops the `undefined` keys, matching the
+  real saved files).
+- **`migrateRoomJsonIntoDatabase`** transparently imports any pre-existing
+  per-room JSON into the new database on first capture, so existing room folders
+  keep working.
+
+### Changed
+
+- **Electron 28 → 38** and **electron-builder 24 → 26**; `@types/node` aligned to
+  `^22.18` to match Electron 38's Node 22 runtime. This is required because
+  `node:sqlite` does not exist in Electron 28's Node 18 runtime — the packaged app
+  would otherwise crash on first capture. Verified empirically that
+  `require('node:sqlite')` loads and round-trips a query inside the Electron 38
+  (Node 22.22) runtime.
+
+### Fixed
+
+- **Newest-first re-captures now re-scan the feed head.** The room-photo cursor's
+  head-insertion check was unreachable dead code: the guards were mutually
+  exclusive (`isFreshNewestFirstRun` required `savedNextSkip <= 0` while the
+  head-check required `savedNextSkip > 0`), so a newest-first re-capture with a
+  saved cursor resumed deep pagination and **silently missed brand-new photos at
+  the top of the feed**. Reworked the cursor logic around a single
+  `isNewestFirstAutoRun` predicate: default-sort auto runs always restart at the
+  head, detect newly-inserted photos, then jump past the previously-scanned
+  region; non-default sorts resume from their own saved cursor. (This was a
+  pre-existing bug, not introduced by the SQLite work — confirmed via `git diff`.)
+
 ## [4.0.8] - 2026-06-05
 
 This is the first release published from the fork. Everything below is new
