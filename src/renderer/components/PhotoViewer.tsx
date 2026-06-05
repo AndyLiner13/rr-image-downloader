@@ -57,11 +57,12 @@ interface PhotoViewerProps {
   libraryMode?: LibraryMode;
   isDownloading?: boolean;
   /**
-   * Cumulative number of images downloaded so far during the current run. Used
-   * in room mode to refresh the viewer once every
-   * {@link ROOM_PHOTO_REFRESH_IMAGE_INTERVAL} images instead of on a timer.
+   * Number of room photo batches that have fully completed during the current
+   * run. Used in room mode to refresh the viewer exactly once per finished
+   * batch (instead of on a timer or per-image count), so the grid updates when
+   * a batch finishes rather than mid-scan when the next batch starts.
    */
-  downloadedImageCount?: number;
+  completedBatchCount?: number;
   onAccountChange?: (accountId: string | undefined) => void;
   onRoomChange?: (roomId: string | undefined) => void;
   onEventCreatorChange?: (creatorAccountId: string | undefined) => void;
@@ -93,13 +94,6 @@ interface PhotoViewerProps {
 type PhotoSource = 'photos' | 'feed' | 'profile-history';
 const PHOTO_VIEW_PAGE_SIZE = 100;
 
-/**
- * While a room download is running, reload the viewer once for every this many
- * newly downloaded images (instead of on a fixed time interval). This keeps the
- * "Download Progress" view fresh without re-querying on every small batch.
- */
-const ROOM_PHOTO_REFRESH_IMAGE_INTERVAL = 1000;
-
 function formatCount(value: number): string {
   return value.toLocaleString();
 }
@@ -111,7 +105,7 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   eventCreatorId: propEventCreatorId,
   libraryMode = 'user',
   isDownloading = false,
-  downloadedImageCount = 0,
+  completedBatchCount = 0,
   onAccountChange,
   onRoomChange,
   onEventCreatorChange,
@@ -198,9 +192,9 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
   });
   const internalScrollRef = useRef<HTMLDivElement | null>(null);
   const wasDownloadingRef = useRef(false);
-  // Tracks the `downloadedImageCount` value at the last room-mode refresh so we
-  // can reload once per ROOM_PHOTO_REFRESH_IMAGE_INTERVAL images downloaded.
-  const lastRefreshImageCountRef = useRef(0);
+  // Tracks the `completedBatchCount` value at the last room-mode refresh so we
+  // can reload once per completed room photo batch.
+  const lastRefreshBatchCountRef = useRef(0);
   const photoLoadInFlightRef = useRef(false);
   const roomVisiblePhotosRef = useRef<Photo[]>([]);
   const roomPageWasManuallyChangedRef = useRef(false);
@@ -1014,9 +1008,11 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
     libraryMode,
   ]);
 
-  // Room mode: refresh the viewer once for every ROOM_PHOTO_REFRESH_IMAGE_INTERVAL
-  // images downloaded, rather than on a fixed timer. `downloadedImageCount` is the
-  // cumulative count shown as "Downloaded" in the Download Progress panel.
+  // Room mode: refresh the viewer once for every completed room photo batch,
+  // rather than on a fixed timer or a per-image count. `completedBatchCount` is
+  // the number of batches that have fully finished during the current run, so
+  // the grid updates when a batch completes instead of mid-scan as the next
+  // batch starts.
   useEffect(() => {
     if (libraryMode !== 'room') {
       return;
@@ -1024,20 +1020,17 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
 
     if (!isDownloading || !activeLibraryId || !filePath) {
       // Reset the baseline so the next run starts counting from zero.
-      lastRefreshImageCountRef.current = downloadedImageCount;
+      lastRefreshBatchCountRef.current = completedBatchCount;
       return;
     }
 
-    // A new run restarts the cumulative counter; re-baseline if it went backwards.
-    if (downloadedImageCount < lastRefreshImageCountRef.current) {
-      lastRefreshImageCountRef.current = downloadedImageCount;
+    // A new run restarts the batch counter; re-baseline if it went backwards.
+    if (completedBatchCount < lastRefreshBatchCountRef.current) {
+      lastRefreshBatchCountRef.current = completedBatchCount;
     }
 
-    if (
-      downloadedImageCount - lastRefreshImageCountRef.current >=
-      ROOM_PHOTO_REFRESH_IMAGE_INTERVAL
-    ) {
-      lastRefreshImageCountRef.current = downloadedImageCount;
+    if (completedBatchCount > lastRefreshBatchCountRef.current) {
+      lastRefreshBatchCountRef.current = completedBatchCount;
       void loadPhotos();
     }
   }, [
@@ -1045,7 +1038,7 @@ export const PhotoViewer: React.FC<PhotoViewerProps> = ({
     isDownloading,
     activeLibraryId,
     filePath,
-    downloadedImageCount,
+    completedBatchCount,
     loadPhotos,
   ]);
 

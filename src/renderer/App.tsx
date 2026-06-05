@@ -2178,8 +2178,8 @@ function App() {
                 }
                 libraryMode={libraryMode}
                 isDownloading={isDownloading}
-                downloadedImageCount={
-                  progress.roomPhotoQueue?.newDownloads ?? 0
+                completedBatchCount={
+                  progress.roomPhotoQueue?.batchesCompleted ?? 0
                 }
                 onAccountChange={handleViewerAccountChange}
                 onRoomChange={handleViewerRoomChange}
