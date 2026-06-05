@@ -10,6 +10,7 @@ pids
 *.pid
 *.seed
 *.pid.lock
+*.out
 
 # Coverage directory used by tools like istanbul
 coverage/
